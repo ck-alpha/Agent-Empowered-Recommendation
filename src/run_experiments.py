@@ -1263,29 +1263,35 @@ def plot_paper_figures(results_json_path: str) -> Dict[str, str]:
     for method in radar_methods:
         raw_radar[method] = [_mean_metric(method, metric) for metric in radar_metrics]
 
+    # 按“指标列”做相对 Min-Max 归一化：
+    # scaled = 0.1 + 0.9 * ((value - min_val) / (max_val - min_val + 1e-8))
+    # 映射到 [0.1, 1.0]，避免最差方法在某轴退化到圆心(0)。
     normalized_radar: Dict[str, List[Any]] = {method: [None] * len(radar_metrics) for method in radar_methods}
-    for dim_idx, metric_name in enumerate(radar_metrics):
+    for dim_idx, _ in enumerate(radar_metrics):
         dim_values = [raw_radar[m][dim_idx] for m in radar_methods if raw_radar[m][dim_idx] is not None]
         if not dim_values:
             continue
-        v_min = min(dim_values)
-        v_max = max(dim_values)
-        if abs(v_max - v_min) < 1e-12:
-            for m in radar_methods:
-                if raw_radar[m][dim_idx] is not None:
-                    normalized_radar[m][dim_idx] = 1.0
-            continue
+        min_val = float(min(dim_values))
+        max_val = float(max(dim_values))
+        denom = max_val - min_val + 1e-8
         for m in radar_methods:
             v = raw_radar[m][dim_idx]
             if v is None:
                 continue
-            normalized_radar[m][dim_idx] = float((v - v_min) / (v_max - v_min))
+            scaled_value = 0.1 + 0.9 * ((float(v) - min_val) / denom)
+            normalized_radar[m][dim_idx] = float(max(0.1, min(1.0, scaled_value)))
 
     angles = np.linspace(0, 2 * np.pi, len(radar_labels), endpoint=False).tolist()
     angles += angles[:1]
 
-    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
-    ax.grid(True, color='#E5E5E5', linestyle='--', linewidth=0.8, alpha=0.95)
+    # 使用长方形画布并将雷达图放大居中，改善整体观感。
+    fig, ax = plt.subplots(figsize=(13.2, 7.4), subplot_kw=dict(polar=True))
+    ax.set_position([0.17, 0.16, 0.66, 0.68])
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    ax.grid(True, color='#D8D8D8', linestyle='--', linewidth=0.8, alpha=0.65)
+    ax.spines['polar'].set_color('#BDBDBD')
+    ax.spines['polar'].set_linewidth(1.2)
 
     plot_order = ['In-processing (w_B, strong)', 'Greedy_Reranking', 'DualAgent-Rec']
     for method in plot_order:
@@ -1303,21 +1309,33 @@ def plot_paper_figures(results_json_path: str) -> Dict[str, str]:
         line_width = 2.8 if method == 'DualAgent-Rec' else 2.0
         z_order = 5 if method == 'DualAgent-Rec' else 3
         fill_alpha = 0.25 if method == 'DualAgent-Rec' else 0.18
-        ax.plot(angles, vals_closed, linewidth=line_width, color=color, label=radar_display[method], zorder=z_order)
+        ax.plot(
+            angles,
+            vals_closed,
+            linewidth=line_width,
+            color=color,
+            marker='o',
+            markersize=4,
+            label=radar_display[method],
+            zorder=z_order
+        )
         ax.fill(angles, vals_closed, alpha=fill_alpha, color=color, zorder=z_order - 1)
 
+    display_radar_labels = ['Real NDCG@10', 'Intra-list\nDiversity', 'List\nNovelty', 'Overall\nFeasibility Rate']
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(radar_labels)
+    ax.set_xticklabels(display_radar_labels)
+    ax.tick_params(axis='x', pad=10)
     ax.set_ylim(0, 1.0)
-    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_yticklabels(['0.2', '0.4', '0.6', '0.8', '1.0'])
+    ax.set_yticks([0.25, 0.5, 0.75, 1.0])
+    # 雷达图形状表达“相对强弱”，内部网格保留但不显示具体数字。
+    ax.set_yticklabels([])
     if not any(_runs('In-processing (w_B, strong)')):
         ax.text(0.5, 0.12, 'N/A: In-processing (B, λ=100) missing', transform=ax.transAxes, ha='center', fontsize=9, color='#666666')
-    ax.set_title('Figure 4. Performance Radar Chart (Normalized)')
-    ax.legend(loc='upper right', bbox_to_anchor=(1.30, 1.10))
-    plt.tight_layout()
+    fig.suptitle('Figure 4. Performance Radar Chart (Normalized)', y=0.97, fontsize=19)
+    # 图例下置并横向排列，避免与轴标签冲突。
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.13), ncol=3, frameon=True, edgecolor='#B5B5B5')
     radar_path = os.path.join(output_dir, 'performance_radar.png')
-    plt.savefig(radar_path, dpi=300, bbox_inches='tight')
+    plt.savefig(radar_path, dpi=300)
     plt.close()
     figure_paths['performance_radar'] = radar_path
 
