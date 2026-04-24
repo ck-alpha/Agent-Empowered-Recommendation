@@ -209,6 +209,8 @@ def run_single_experiment(
     metrics['runtime_seconds'] = (end_time - start_time).total_seconds()
     if framework.history:
         metrics['history'] = framework.history
+        # [新增监控指标: generation_history alias]
+        metrics['generation_history'] = framework.history
 
     if include_pareto_solutions:
         pareto_solutions = []
@@ -377,13 +379,12 @@ def aggregate_user_metrics(
         aggregated['pareto_solutions'] = pareto_solutions
         aggregated['pareto_point_count'] = len(pareto_solutions)
 
-    # [Task 2: 每代记录]
-    # Aggregate per-user generation history to run-level history.
-    if any(isinstance(r.get('history'), list) for r in user_results):
-        gen_feas_map: Dict[int, List[float]] = {}
-        gen_hv_map: Dict[int, List[float]] = {}
+    # [新增监控指标: history aggregation]
+    # Aggregate per-user generation-level numeric fields to run-level history.
+    if any(isinstance(r.get('history') or r.get('generation_history'), list) for r in user_results):
+        gen_metric_map: Dict[int, Dict[str, List[float]]] = {}
         for r in user_results:
-            history = r.get('history') or []
+            history = r.get('history') or r.get('generation_history') or []
             if not isinstance(history, list):
                 continue
             for row in history:
@@ -392,26 +393,33 @@ def aggregate_user_metrics(
                 gen = row.get('generation')
                 if not isinstance(gen, int):
                     continue
-                feas = row.get('feasibility_rate')
-                if feas is None and isinstance(row.get('constraint_metrics'), dict):
-                    feas = row['constraint_metrics'].get('overall_feasibility')
-                hv = row.get('hypervolume')
-                if isinstance(feas, (int, float)):
-                    gen_feas_map.setdefault(gen, []).append(float(feas))
-                if isinstance(hv, (int, float)):
-                    gen_hv_map.setdefault(gen, []).append(float(hv))
 
-        if gen_feas_map or gen_hv_map:
-            history_rows = []
-            all_generations = sorted(set(gen_feas_map.keys()) | set(gen_hv_map.keys()))
-            for gen in all_generations:
-                row: Dict[str, Any] = {'generation': gen}
-                if gen in gen_feas_map:
-                    row['feasibility_rate'] = float(np.mean(gen_feas_map[gen]))
-                if gen in gen_hv_map:
-                    row['hypervolume'] = float(np.mean(gen_hv_map[gen]))
-                history_rows.append(row)
+                if (
+                    row.get('feasibility_rate') is None
+                    and isinstance(row.get('constraint_metrics'), dict)
+                    and isinstance(row['constraint_metrics'].get('overall_feasibility'), (int, float))
+                ):
+                    row = dict(row)
+                    row['feasibility_rate'] = row['constraint_metrics']['overall_feasibility']
+
+                gen_metric_map.setdefault(gen, {})
+                for key, value in row.items():
+                    if key == 'generation':
+                        continue
+                    if isinstance(value, (int, float)):
+                        gen_metric_map[gen].setdefault(key, []).append(float(value))
+
+        if gen_metric_map:
+            history_rows: List[Dict[str, Any]] = []
+            for gen in sorted(gen_metric_map.keys()):
+                row_out: Dict[str, Any] = {'generation': gen}
+                for key in sorted(gen_metric_map[gen].keys()):
+                    vals = gen_metric_map[gen][key]
+                    if vals:
+                        row_out[key] = float(np.mean(vals))
+                history_rows.append(row_out)
             aggregated['history'] = history_rows
+            aggregated['generation_history'] = history_rows
             aggregated['history_point_count'] = len(history_rows)
 
     optional_numeric_keys = [
@@ -893,6 +901,7 @@ def plot_paper_figures(results_json_path: str) -> Dict[str, str]:
     4) 4D performance radar chart
     5) DualAgent convergence subplots (Feasibility & HV)
     6) Real NDCG@10 bar chart (5 methods)
+    7) Monitoring figures (diversity/spacing, survivors, risk/epsilon, objective trajectories)
     """
     os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
     import matplotlib.pyplot as plt
@@ -965,6 +974,42 @@ def plot_paper_figures(results_json_path: str) -> Dict[str, str]:
         if not values:
             return None
         return float(np.mean(values))
+
+    # [新增监控指标: visualization helper]
+    def _generation_series(metric_name: str) -> Tuple[List[int], List[float]]:
+        """Aggregate a generation-level metric across DualAgent runs."""
+        gen_map: Dict[int, List[float]] = {}
+        for run in _runs('DualAgent-Rec'):
+            history = run.get('history') or run.get('generation_history') or []
+            if not isinstance(history, list):
+                continue
+            for row in history:
+                if not isinstance(row, dict):
+                    continue
+                gen = row.get('generation')
+                if not isinstance(gen, int):
+                    continue
+                value = row.get(metric_name)
+                if (
+                    value is None
+                    and metric_name == 'feasibility_rate'
+                    and isinstance(row.get('constraint_metrics'), dict)
+                ):
+                    value = row['constraint_metrics'].get('overall_feasibility')
+                if isinstance(value, (int, float)):
+                    gen_map.setdefault(gen, []).append(float(value))
+        generations = sorted(gen_map.keys())
+        series = [float(np.mean(gen_map[g])) for g in generations]
+        return generations, series
+
+    def _align_series(
+        generations: List[int],
+        series: List[float],
+        target_generations: List[int],
+    ) -> List[float]:
+        """Align a generation series to target x-axis; missing points are NaN."""
+        value_map = {g: v for g, v in zip(generations, series)}
+        return [float(value_map[g]) if g in value_map else float(np.nan) for g in target_generations]
 
     def _extract_frontier_2d(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
         if not points:
@@ -1426,6 +1471,116 @@ def plot_paper_figures(results_json_path: str) -> Dict[str, str]:
     plt.savefig(conv_path, dpi=300, bbox_inches='tight')
     plt.close()
     figure_paths['dualagent_convergence_subplots'] = conv_path
+
+    # [新增监控指标: visualization]
+    # Monitor 1: Pareto size & population spacing
+    gen_pareto, pareto_series = _generation_series('pareto_size')
+    gen_spacing, spacing_series = _generation_series('population_spacing')
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), sharex=True)
+    for ax in axes:
+        ax.grid(True, color='#E5E5E5', linestyle='--', linewidth=0.8, alpha=0.95)
+        ax.set_xlabel('Generation')
+    axes[0].set_title('Monitor A: Pareto Front Size')
+    if gen_pareto and pareto_series:
+        axes[0].plot(gen_pareto, pareto_series, '-o', color=method_colors['DualAgent-Rec'], markersize=3.8, linewidth=2.0)
+        axes[0].set_ylabel('Pareto Size')
+    else:
+        axes[0].text(0.5, 0.5, 'N/A: pareto_size missing', transform=axes[0].transAxes, ha='center', va='center', fontsize=10, color='#666666')
+        axes[0].set_ylabel('Pareto Size')
+
+    axes[1].set_title('Monitor B: Population Spacing')
+    if gen_spacing and spacing_series:
+        axes[1].plot(gen_spacing, spacing_series, '-o', color=method_colors['In-processing (w_B, strong)'], markersize=3.8, linewidth=2.0)
+        axes[1].set_ylabel('Spacing')
+    else:
+        axes[1].text(0.5, 0.5, 'N/A: population_spacing missing', transform=axes[1].transAxes, ha='center', va='center', fontsize=10, color='#666666')
+        axes[1].set_ylabel('Spacing')
+    fig.suptitle('Monitoring Figure 1. Diversity & Expansion', y=1.02)
+    plt.tight_layout()
+    monitor_div_path = os.path.join(output_dir, 'monitor_diversity_spacing.png')
+    plt.savefig(monitor_div_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    figure_paths['monitor_diversity_spacing'] = monitor_div_path
+
+    # [新增监控指标: visualization]
+    # Monitor 2: LLM vs DE survivors
+    gen_llm, llm_series = _generation_series('llm_survivors')
+    gen_de, de_series = _generation_series('de_survivors')
+    fig, ax = plt.subplots(figsize=(11, 5.8))
+    ax.grid(True, color='#E5E5E5', linestyle='--', linewidth=0.8, alpha=0.95)
+    all_gens_survivor = sorted(set(gen_llm) | set(gen_de))
+    if all_gens_survivor:
+        llm_aligned = _align_series(gen_llm, llm_series, all_gens_survivor)
+        de_aligned = _align_series(gen_de, de_series, all_gens_survivor)
+        ax.plot(all_gens_survivor, llm_aligned, '-o', color=method_colors['Greedy_Reranking'], markersize=4, linewidth=2.0, label='LLM Survivors')
+        ax.plot(all_gens_survivor, de_aligned, '-o', color=method_colors['DualAgent-Rec'], markersize=4, linewidth=2.0, label='DE Survivors')
+        ax.legend(loc='best', frameon=True)
+    else:
+        ax.text(0.5, 0.5, 'N/A: llm_survivors/de_survivors missing', transform=ax.transAxes, ha='center', va='center', fontsize=10, color='#666666')
+    ax.set_xlabel('Generation')
+    ax.set_ylabel('Survivor Count')
+    ax.set_title('Monitoring Figure 2. Agent Contribution Survivors')
+    plt.tight_layout()
+    monitor_survivor_path = os.path.join(output_dir, 'monitor_agent_survivors.png')
+    plt.savefig(monitor_survivor_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    figure_paths['monitor_agent_survivors'] = monitor_survivor_path
+
+    # [新增监控指标: visualization]
+    # Monitor 3: invalid generated count & epsilon trajectory
+    gen_invalid, invalid_series = _generation_series('invalid_generated_count')
+    gen_eps, eps_series = _generation_series('current_epsilon')
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), sharex=True)
+    for ax in axes:
+        ax.grid(True, color='#E5E5E5', linestyle='--', linewidth=0.8, alpha=0.95)
+        ax.set_xlabel('Generation')
+    axes[0].set_title('Monitor C: Invalid Generated Count')
+    if gen_invalid and invalid_series:
+        axes[0].plot(gen_invalid, invalid_series, '-o', color=method_colors['In-processing (w_B, strong)'], markersize=3.8, linewidth=2.0)
+        axes[0].set_ylabel('Invalid Count')
+    else:
+        axes[0].text(0.5, 0.5, 'N/A: invalid_generated_count missing', transform=axes[0].transAxes, ha='center', va='center', fontsize=10, color='#666666')
+        axes[0].set_ylabel('Invalid Count')
+
+    axes[1].set_title('Monitor D: Epsilon Trajectory')
+    if gen_eps and eps_series:
+        axes[1].plot(gen_eps, eps_series, '-o', color=method_colors['DualAgent-Rec'], markersize=3.8, linewidth=2.0)
+        axes[1].set_ylabel('Current Epsilon')
+        axes[1].set_ylim(0.0, 1.05)
+    else:
+        axes[1].text(0.5, 0.5, 'N/A: current_epsilon missing', transform=axes[1].transAxes, ha='center', va='center', fontsize=10, color='#666666')
+        axes[1].set_ylabel('Current Epsilon')
+        axes[1].set_ylim(0.0, 1.05)
+    fig.suptitle('Monitoring Figure 3. Risk Control & Epsilon', y=1.02)
+    plt.tight_layout()
+    monitor_risk_path = os.path.join(output_dir, 'monitor_risk_epsilon.png')
+    plt.savefig(monitor_risk_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    figure_paths['monitor_risk_epsilon'] = monitor_risk_path
+
+    # [新增监控指标: visualization]
+    # Monitor 4: objective trajectories
+    gen_acc, acc_series = _generation_series('avg_generation_accuracy')
+    gen_div, div_series = _generation_series('avg_generation_diversity')
+    fig, ax = plt.subplots(figsize=(11, 5.8))
+    ax.grid(True, color='#E5E5E5', linestyle='--', linewidth=0.8, alpha=0.95)
+    all_gens_obj = sorted(set(gen_acc) | set(gen_div))
+    if all_gens_obj:
+        acc_aligned = _align_series(gen_acc, acc_series, all_gens_obj)
+        div_aligned = _align_series(gen_div, div_series, all_gens_obj)
+        ax.plot(all_gens_obj, acc_aligned, '-o', color=method_colors['DualAgent-Rec'], markersize=4, linewidth=2.0, label='Avg Generation Accuracy')
+        ax.plot(all_gens_obj, div_aligned, '-o', color=method_colors['Greedy_Reranking'], markersize=4, linewidth=2.0, label='Avg Generation Diversity')
+        ax.legend(loc='best', frameon=True)
+    else:
+        ax.text(0.5, 0.5, 'N/A: objective trajectories missing', transform=ax.transAxes, ha='center', va='center', fontsize=10, color='#666666')
+    ax.set_xlabel('Generation')
+    ax.set_ylabel('Metric Value')
+    ax.set_title('Monitoring Figure 4. Objective Trajectories')
+    plt.tight_layout()
+    monitor_obj_path = os.path.join(output_dir, 'monitor_objective_trajectories.png')
+    plt.savefig(monitor_obj_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    figure_paths['monitor_objective_trajectories'] = monitor_obj_path
 
     # [Task 3: 新增真实NDCG图]
     # Figure 6: Dedicated bar chart for real offline NDCG@10 (5 methods).

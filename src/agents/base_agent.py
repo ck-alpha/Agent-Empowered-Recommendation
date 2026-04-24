@@ -18,6 +18,9 @@ np.random.seed(RANDOM_SEED)
 class Individual:
     """Represents a recommendation solution (individual in population)."""
     item_ids: List[str]  # List of recommended item IDs
+    # [新增监控指标: source]
+    # 个体来源标签，用于统计 DE / LLM 在环境选择后的存活贡献。
+    source: str = 'INIT'
     scores: np.ndarray = field(default_factory=lambda: np.array([]))  # Objective scores [f1, f2, f3]
     constraint_violations: np.ndarray = field(default_factory=lambda: np.array([]))  # Constraint violations
     fitness: float = 0.0
@@ -225,7 +228,10 @@ class BaseAgent(ABC):
         Uniform crossover for recommendation lists.
         """
         if random.random() > self.crossover_rate:
-            return Individual(item_ids=parent1.item_ids.copy()), Individual(item_ids=parent2.item_ids.copy())
+            return (
+                Individual(item_ids=parent1.item_ids.copy(), source=parent1.source),
+                Individual(item_ids=parent2.item_ids.copy(), source=parent2.source),
+            )
 
         # Use minimum length to avoid index errors
         k = min(len(parent1.item_ids), len(parent2.item_ids))
@@ -244,7 +250,10 @@ class BaseAgent(ABC):
         child1_items = list(dict.fromkeys(child1_items))
         child2_items = list(dict.fromkeys(child2_items))
 
-        return Individual(item_ids=child1_items), Individual(item_ids=child2_items)
+        return (
+            Individual(item_ids=child1_items, source=parent1.source),
+            Individual(item_ids=child2_items, source=parent2.source),
+        )
 
     def mutate(self, individual: Individual, candidate_items: List[str]) -> Individual:
         """
@@ -259,7 +268,7 @@ class BaseAgent(ABC):
                 if available:
                     mutated_items[i] = random.choice(available)
 
-        return Individual(item_ids=mutated_items)
+        return Individual(item_ids=mutated_items, source=individual.source)
 
     def environmental_selection(self, combined: List[Individual]) -> List[Individual]:
         """

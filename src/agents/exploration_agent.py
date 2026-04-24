@@ -154,9 +154,13 @@ class ExplorationAgent(BaseAgent):
                     break
 
             child = Individual(item_ids=child_items[:self.k])
+            # [新增监控指标: source]
+            # exploration 分支产生的子代统一标记为 LLM。
+            child.source = 'LLM'
 
             # Higher mutation rate for exploration
             child = self.mutate(child, self.candidate_items)
+            child.source = 'LLM'
 
             offspring.append(child)
 

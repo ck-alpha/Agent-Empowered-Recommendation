@@ -90,6 +90,8 @@ class DualAgentRec:
         self.generation = 0
         self.history: List[Dict[str, Any]] = []
         self.best_solutions: List[Individual] = []
+        # [新增监控指标: generation monitor]
+        self._latest_generation_monitor: Dict[str, Any] = {}
 
     def _init_agents(self):
         """Initialize dual agents."""
@@ -187,14 +189,22 @@ class DualAgentRec:
 
             # Get constraint metrics
             constraint_metrics = self._get_constraint_metrics()
+            # [新增监控指标: objective/diversity snapshot]
+            generation_monitor = self._compute_generation_population_snapshot()
+            invalid_generated_count = 0
+            llm_survivors = 0
+            de_survivors = 0
 
             if self.config.is_single_population:
                 # 修改点：严格单分支，固定 exploitation 比例并禁用探索进化与知识迁移。
                 exploitation_ratio = 1.0
                 reasoning = "Single population mode: fixed exploitation_ratio=1.0"
                 exploit_children = self.exploitation_agent.evolve(self.config.population_size)
+                # [新增监控指标: risk control]
+                invalid_generated_count = self._count_invalid_generated_offspring(exploit_children, item_features)
                 combined_exploit = self.exploitation_agent.population + exploit_children
                 self.exploitation_agent.population = self.exploitation_agent.environmental_selection(combined_exploit)
+                llm_survivors, de_survivors = self._count_survivors_by_source()
             else:
                 # 协调器输出 α（exploitation 占比），对应论文中的动态资源分配。
                 exploitation_ratio, reasoning = self.coordinator.get_resource_allocation(
@@ -221,6 +231,16 @@ class DualAgentRec:
                     self.exploration_agent.population,
                     num_children=min(10, total_offspring // 5)
                 )
+                # [新增监控指标: source]
+                for child in transfer_children:
+                    child.source = 'MIXED'
+
+                # [新增监控指标: risk control]
+                invalid_generated_count = (
+                    self._count_invalid_generated_offspring(exploit_children, item_features)
+                    + self._count_invalid_generated_offspring(explore_children, item_features)
+                    + self._count_invalid_generated_offspring(transfer_children, item_features)
+                )
 
                 # 父代+子代+迁移子代合并后环境选择，形成下一代精英种群。
                 combined_exploit = self.exploitation_agent.population + exploit_children + transfer_children
@@ -228,12 +248,22 @@ class DualAgentRec:
 
                 self.exploitation_agent.population = self.exploitation_agent.environmental_selection(combined_exploit)
                 self.exploration_agent.population = self.exploration_agent.environmental_selection(combined_explore)
+                llm_survivors, de_survivors = self._count_survivors_by_source()
 
+            # [新增监控指标: epsilon]
+            current_epsilon = float(self.constraint_handler.epsilon)
             # 依据全局可行率更新 epsilon，实现“早期放宽、后期收紧”的约束策略。
             self.constraint_handler.update_epsilon(constraint_metrics.get('overall_feasibility', 0.5))
 
             # Update best solutions
             self._update_best_solutions()
+            generation_monitor.update({
+                'llm_survivors': int(llm_survivors),
+                'de_survivors': int(de_survivors),
+                'invalid_generated_count': int(invalid_generated_count),
+                'current_epsilon': current_epsilon,
+            })
+            self._latest_generation_monitor = generation_monitor
 
             # Log progress
             if gen % 10 == 0:
@@ -241,7 +271,13 @@ class DualAgentRec:
 
             # Save history
             if self.config.save_history:
-                self._save_generation_history(gen, exploit_metrics, explore_metrics, constraint_metrics)
+                self._save_generation_history(
+                    gen,
+                    exploit_metrics,
+                    explore_metrics,
+                    constraint_metrics,
+                    generation_monitor=generation_monitor,
+                )
 
         # [Task 2: 每代记录]
         # 补齐末端代数快照（例如 max_generations=50 时补充 generation=50），
@@ -337,6 +373,8 @@ class DualAgentRec:
 
             # Crossover
             child1, child2 = self.exploitation_agent.crossover(parent1, parent2)
+            child1.source = 'MIXED'
+            child2.source = 'MIXED'
             children.extend([child1, child2])
 
         return children[:num_children]
@@ -381,11 +419,13 @@ class DualAgentRec:
         generation: int,
         exploit_metrics: Dict,
         explore_metrics: Dict,
-        constraint_metrics: Dict
+        constraint_metrics: Dict,
+        generation_monitor: Optional[Dict[str, Any]] = None,
     ):
         """Save generation history for analysis."""
         # [Task 2: 每代记录]
         # 每一代都显式写入 feasibility_rate 与 hypervolume，供平滑收敛曲线使用。
+        generation_monitor = generation_monitor or {}
         feasibility_rate = float(constraint_metrics.get('overall_feasibility', 0.0))
         hypervolume = self._compute_current_hypervolume()
 
@@ -393,10 +433,21 @@ class DualAgentRec:
             'generation': generation,
             'feasibility_rate': feasibility_rate,
             'hypervolume': hypervolume,
+            # [新增监控指标: population diversity]
+            'pareto_size': int(generation_monitor.get('pareto_size', len(self.best_solutions))),
+            'population_spacing': float(generation_monitor.get('population_spacing', 0.0)),
+            # [新增监控指标: agent contribution]
+            'llm_survivors': int(generation_monitor.get('llm_survivors', 0)),
+            'de_survivors': int(generation_monitor.get('de_survivors', 0)),
+            # [新增监控指标: risk control]
+            'invalid_generated_count': int(generation_monitor.get('invalid_generated_count', 0)),
+            'current_epsilon': float(generation_monitor.get('current_epsilon', self.constraint_handler.epsilon)),
+            # [新增监控指标: objective trajectories]
+            'avg_generation_accuracy': float(generation_monitor.get('avg_generation_accuracy', 0.0)),
+            'avg_generation_diversity': float(generation_monitor.get('avg_generation_diversity', 0.0)),
             'exploitation_metrics': exploit_metrics,
             'exploration_metrics': explore_metrics,
             'constraint_metrics': constraint_metrics,
-            'pareto_size': len(self.best_solutions),
             'coordinator_summary': self.coordinator.get_coordination_summary(),
         })
 
@@ -423,7 +474,70 @@ class DualAgentRec:
             exploit_metrics=exploit_metrics,
             explore_metrics=explore_metrics,
             constraint_metrics=constraint_metrics,
+            generation_monitor=self._latest_generation_monitor,
         )
+
+    # [新增监控指标: population diversity / objective trajectories]
+    def _compute_generation_population_snapshot(self) -> Dict[str, Any]:
+        """Compute lightweight generation-level monitoring metrics from current evaluated populations."""
+        active_individuals = self._get_active_individuals()
+        if not active_individuals:
+            return {
+                'pareto_size': 0,
+                'population_spacing': 0.0,
+                'avg_generation_accuracy': 0.0,
+                'avg_generation_diversity': 0.0,
+            }
+
+        fronts = self.exploitation_agent.non_dominated_sort(active_individuals)
+        rank1 = fronts[0] if fronts else []
+        pareto_size = len(rank1)
+
+        rank1_scores = [ind.scores for ind in rank1 if len(ind.scores) > 0]
+        active_scores = [ind.scores for ind in active_individuals if len(ind.scores) > 0]
+        if len(rank1_scores) >= 2:
+            population_spacing = float(MultiObjectiveMetrics.spacing(rank1_scores))
+        elif len(active_scores) >= 2:
+            population_spacing = float(MultiObjectiveMetrics.spacing(active_scores))
+        else:
+            population_spacing = 0.0
+
+        avg_generation_accuracy = float(np.mean([ind.scores[0] for ind in active_individuals])) if active_individuals else 0.0
+        avg_generation_diversity = float(np.mean([ind.scores[1] for ind in active_individuals])) if active_individuals else 0.0
+
+        return {
+            'pareto_size': int(pareto_size),
+            'population_spacing': population_spacing,
+            'avg_generation_accuracy': avg_generation_accuracy,
+            'avg_generation_diversity': avg_generation_diversity,
+        }
+
+    # [新增监控指标: risk control]
+    def _count_invalid_generated_offspring(
+        self,
+        offspring: List[Individual],
+        item_features: Dict[str, Dict],
+        severe_violation_threshold: float = 0.5,
+    ) -> int:
+        """
+        Count severely invalid offspring in current generation.
+        Note: this method only counts and does not discard offspring.
+        """
+        invalid_count = 0
+        for child in offspring:
+            violations = self.constraint_handler.calculate_violations(child.item_ids, item_features)
+            total_violation = float(np.sum(np.maximum(0.0, np.array(violations, dtype=float))))
+            if total_violation > severe_violation_threshold:
+                invalid_count += 1
+        return int(invalid_count)
+
+    # [新增监控指标: agent contribution]
+    def _count_survivors_by_source(self) -> Tuple[int, int]:
+        """Count DE/LLM survivors after environmental selection."""
+        active_individuals = self._get_active_individuals()
+        llm_survivors = sum(1 for ind in active_individuals if getattr(ind, 'source', 'INIT') == 'LLM')
+        de_survivors = sum(1 for ind in active_individuals if getattr(ind, 'source', 'INIT') == 'DE')
+        return int(llm_survivors), int(de_survivors)
 
     def _compute_current_hypervolume(self) -> float:
         """Compute current hypervolume on the maintained best solution set."""
@@ -508,6 +622,7 @@ class DualAgentRec:
             },
             'final_metrics': self._compute_final_metrics(),
             'history': self.history,
+            'generation_history': self.history,
             'best_solutions': [
                 {
                     'items': ind.item_ids,
