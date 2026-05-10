@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 
 from .base_agent import Individual
-from constraints import ConstraintConfig, ConstraintHandler
+from constraints import (
+    ConstraintConfig,
+    ConstraintHandler,
+    EcommerceConstraintConfig,
+    EcommerceConstraintHandler,
+)
 from evaluation import MultiObjectiveMetrics, ObjectivesCalculator, RecommendationMetrics
 
 
@@ -397,4 +403,359 @@ class GreedyRerankingBaseline:
             "recommendation_size": int(k),
             "num_rerank_iterations": int(iterations),
             "recommended_items": current_topk.copy(),
+        }
+
+
+@dataclass
+class EcommercePostProcessingConfig:
+    """Configuration for scenario-1 e-commerce post-processing baseline."""
+
+    top_k: int = 10
+    alpha_inv: float = 0.05
+    required_new_count: int = 2
+    min_sellers: int = 3
+    target_entropy_threshold: float = 1.5
+    lambda_budget: float = 1.0
+    rho_budget: float = 1.0
+    base_score_col: str = "base_score"
+
+
+class EcommercePostProcessingAgent:
+    """
+    场景一电商后处理基线。
+
+    策略顺序：
+    1) 库存机会约束作为绝对硬红线，先过滤高缺货风险商品。
+    2) 用 item-level 预算偏离构造 ALM 惩罚，对传统召回分数做重排。
+    3) 对 Top-K 列表做新品底线和供应商多样性的贪心替换修复。
+    """
+
+    def __init__(self, config: Optional[EcommercePostProcessingConfig] = None):
+        self.config = config or EcommercePostProcessingConfig()
+        self.constraint_handler = EcommerceConstraintHandler(
+            EcommerceConstraintConfig(
+                alpha_inv=self.config.alpha_inv,
+                required_new_count=self.config.required_new_count,
+                min_sellers=self.config.min_sellers,
+                target_entropy_threshold=self.config.target_entropy_threshold,
+                lambda_budget=self.config.lambda_budget,
+                rho_budget=self.config.rho_budget,
+            )
+        )
+
+    @staticmethod
+    def _to_dataframe(candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]]) -> pd.DataFrame:
+        """统一候选输入格式，copy 后处理，避免污染调用方数据。"""
+        if isinstance(candidate_items, pd.DataFrame):
+            return candidate_items.copy()
+        if isinstance(candidate_items, list):
+            return pd.DataFrame(candidate_items).copy()
+        raise TypeError("candidate_items must be a pandas DataFrame or a list of dictionaries.")
+
+    @staticmethod
+    def _resolve_budget_info(user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]]) -> Optional[Dict[str, float]]:
+        """标准化用户预算；None 表示本轮不做预算惩罚。"""
+        if user_budget_info is None:
+            return None
+        if isinstance(user_budget_info, pd.Series):
+            data = user_budget_info.to_dict()
+        elif isinstance(user_budget_info, Mapping):
+            data = dict(user_budget_info)
+        else:
+            raise TypeError("user_budget_info must be a dict, pandas Series, or None.")
+
+        missing = [key for key in ("target_budget", "budget_tolerance") if key not in data]
+        if missing:
+            raise ValueError(f"user_budget_info missing required keys: {missing}")
+
+        target_budget = float(data["target_budget"])
+        budget_tolerance = float(data["budget_tolerance"])
+        if not np.isfinite(target_budget) or not np.isfinite(budget_tolerance):
+            raise ValueError("target_budget and budget_tolerance must be finite numbers.")
+        return {
+            "target_budget": target_budget,
+            "budget_tolerance": max(0.0, budget_tolerance),
+        }
+
+    def _prepare_candidates(
+        self,
+        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
+        user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]],
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """准备候选集：补 base_score、计算 item-level ALM 预算惩罚和 final_score。"""
+        df = self._to_dataframe(candidate_items)
+        diagnostics = {
+            "base_score_missing": False,
+            "budget_evaluated": user_budget_info is not None,
+        }
+
+        if "item_id" not in df.columns:
+            raise ValueError("candidate_items requires an item_id column.")
+
+        score_col = self.config.base_score_col
+        if score_col not in df.columns:
+            df[score_col] = 0.0
+            diagnostics["base_score_missing"] = True
+
+        df[score_col] = pd.to_numeric(df[score_col], errors="coerce").fillna(0.0).astype(float)
+        budget_info = self._resolve_budget_info(user_budget_info)
+
+        if budget_info is None or df.empty:
+            df["item_budget_penalty"] = 0.0
+            df["item_budget_alm_penalty"] = 0.0
+        else:
+            if "price_filled" not in df.columns:
+                raise ValueError("candidate_items requires a price_filled column when user_budget_info is provided.")
+            prices = pd.to_numeric(df["price_filled"], errors="coerce")
+            deviations = (prices - budget_info["target_budget"]).abs()
+            item_penalty = (deviations - budget_info["budget_tolerance"]).clip(lower=0.0).fillna(0.0)
+            df["item_budget_penalty"] = item_penalty.astype(float)
+            # 增广拉格朗日项：lambda * phi + rho/2 * phi^2。这里按商品逐项扣分，排序才会真的变化。
+            df["item_budget_alm_penalty"] = (
+                self.config.lambda_budget * df["item_budget_penalty"]
+                + 0.5 * self.config.rho_budget * df["item_budget_penalty"] ** 2
+            ).astype(float)
+
+        df["final_score"] = df[score_col] - df["item_budget_alm_penalty"]
+        return df, diagnostics
+
+    @staticmethod
+    def _sort_candidates(df: pd.DataFrame) -> pd.DataFrame:
+        """按后处理得分降序排序，并用 item_id 稳定打破平分。"""
+        if df.empty:
+            return df.copy()
+        return df.sort_values(["final_score", "item_id"], ascending=[False, True]).reset_index(drop=True)
+
+    @staticmethod
+    def _lowest_score_index(df: pd.DataFrame) -> Optional[int]:
+        """返回 final_score 最低项的行位置。"""
+        if df.empty:
+            return None
+        return int(df["final_score"].astype(float).idxmin())
+
+    def _candidate_pool(self, ranked: pd.DataFrame, current: pd.DataFrame) -> pd.DataFrame:
+        """返回尚未进入当前推荐列表的候选池。"""
+        selected_ids = set(current["item_id"].tolist()) if "item_id" in current.columns else set()
+        return ranked.loc[~ranked["item_id"].isin(selected_ids)].copy()
+
+    @staticmethod
+    def _compact_constraint_result(result: Dict[str, Any]) -> Dict[str, Any]:
+        """压缩 Handler 约束结果，避免 diagnostics 内嵌 DataFrame 影响日志/JSON 追溯。"""
+        compact = dict(result)
+        compact.pop("inventory_feasible_items", None)
+        return compact
+
+    def _swap_rows(
+        self,
+        current: pd.DataFrame,
+        replacement: pd.Series,
+        remove_idx: int,
+    ) -> pd.DataFrame:
+        """用 replacement 替换 current 中指定行，保持 DataFrame 结构稳定。"""
+        updated = current.copy()
+        updated.loc[remove_idx, :] = replacement
+        return self._sort_candidates(updated)
+
+    def _repair_new_items(
+        self,
+        current: pd.DataFrame,
+        ranked: pd.DataFrame,
+        swap_log: List[Dict[str, Any]],
+    ) -> pd.DataFrame:
+        """新品底线贪心修复：用高分新品替换低分非新品。"""
+        max_iterations = max(0, len(ranked) - len(current))
+        iterations = 0
+
+        while (
+            len(current) > 0
+            and not self.constraint_handler.check_new_item_floor(current, self.config.required_new_count)
+            and iterations <= max_iterations
+        ):
+            before_count = int(current["is_new"].fillna(False).astype(bool).sum())
+            pool = self._candidate_pool(ranked, current)
+            replacements = pool.loc[pool["is_new"].fillna(False).astype(bool)]
+            if replacements.empty:
+                break
+
+            removable = current.loc[~current["is_new"].fillna(False).astype(bool)]
+            if removable.empty:
+                break
+
+            remove_idx = self._lowest_score_index(removable)
+            if remove_idx is None:
+                break
+
+            replacement = replacements.iloc[0]
+            removed = current.loc[remove_idx].copy()
+            current = self._swap_rows(current, replacement, remove_idx)
+            after_count = int(current["is_new"].fillna(False).astype(bool).sum())
+            swap_log.append(
+                {
+                    "reason": "new_item_floor",
+                    "removed_item_id": removed.get("item_id"),
+                    "added_item_id": replacement.get("item_id"),
+                    "before_count": before_count,
+                    "after_count": after_count,
+                }
+            )
+            iterations += 1
+
+        return current
+
+    def _repair_seller_diversity(
+        self,
+        current: pd.DataFrame,
+        ranked: pd.DataFrame,
+        swap_log: List[Dict[str, Any]],
+    ) -> pd.DataFrame:
+        """供应商多样性贪心修复：优先引入当前列表未覆盖的新 seller。"""
+        max_iterations = max(0, len(ranked) - len(current))
+        iterations = 0
+
+        while (
+            len(current) > 0
+            and not self.constraint_handler.check_seller_diversity(current, self.config.min_sellers)
+            and iterations <= max_iterations
+        ):
+            before_count = int(current["seller_id"].dropna().nunique())
+            current_sellers = set(current["seller_id"].dropna().tolist())
+            pool = self._candidate_pool(ranked, current)
+            replacements = pool.loc[~pool["seller_id"].isin(current_sellers)]
+            if replacements.empty:
+                break
+
+            seller_counts = current["seller_id"].value_counts(dropna=True)
+            duplicate_sellers = set(seller_counts[seller_counts > 1].index.tolist())
+            removable = current.loc[current["seller_id"].isin(duplicate_sellers)]
+            if removable.empty:
+                removable = current
+
+            remove_idx = self._lowest_score_index(removable)
+            if remove_idx is None:
+                break
+
+            replacement = replacements.iloc[0]
+            removed = current.loc[remove_idx].copy()
+            current = self._swap_rows(current, replacement, remove_idx)
+            after_count = int(current["seller_id"].dropna().nunique())
+            swap_log.append(
+                {
+                    "reason": "seller_diversity",
+                    "removed_item_id": removed.get("item_id"),
+                    "added_item_id": replacement.get("item_id"),
+                    "before_count": before_count,
+                    "after_count": after_count,
+                }
+            )
+            iterations += 1
+
+        return current
+
+    def recommend(
+        self,
+        user_id: str,
+        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
+        user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]],
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        执行基于 ALM 重排与贪心替换的后处理推荐。
+
+        返回 recommendations DataFrame、item_ids，以及可追溯 diagnostics。
+        """
+        requested_k = self.config.top_k if top_k is None else int(top_k)
+        requested_k = max(0, requested_k)
+
+        prepared, prep_diag = self._prepare_candidates(candidate_items, user_budget_info)
+        total_candidates = len(prepared)
+        diagnostics: Dict[str, Any] = {
+            "user_id": user_id,
+            "requested_top_k": requested_k,
+            "input_candidate_count": total_candidates,
+            "swap_log": [],
+            **prep_diag,
+        }
+
+        if requested_k == 0 or prepared.empty:
+            empty = prepared.head(0).copy()
+            diagnostics.update(
+                {
+                    "inventory_feasible_count": 0,
+                    "inventory_filtered_count": 0,
+                    "candidate_shortage": requested_k > 0,
+                    "initial_constraints": {},
+                    "final_constraints": {},
+                    "fully_repaired": False,
+                }
+            )
+            return {"recommendations": empty, "item_ids": [], "diagnostics": diagnostics}
+
+        # Step 1: 库存机会约束是绝对硬红线，不满足就直接剔除。
+        inventory_feasible = self.constraint_handler.check_inventory(
+            prepared,
+            alpha_inv=self.config.alpha_inv,
+        )
+        diagnostics["inventory_feasible_count"] = int(len(inventory_feasible))
+        diagnostics["inventory_filtered_count"] = int(total_candidates - len(inventory_feasible))
+
+        if inventory_feasible.empty:
+            diagnostics.update(
+                {
+                    "candidate_shortage": True,
+                    "initial_constraints": {},
+                    "final_constraints": {},
+                    "fully_repaired": False,
+                }
+            )
+            return {
+                "recommendations": inventory_feasible.copy(),
+                "item_ids": [],
+                "diagnostics": diagnostics,
+            }
+
+        # Step 2: 用 item-level 预算 ALM 惩罚重排。熵是列表级性质，留到诊断和修复后评估。
+        ranked = self._sort_candidates(inventory_feasible)
+        k = min(requested_k, len(ranked))
+        current = ranked.head(k).copy()
+        diagnostics["candidate_shortage"] = bool(len(ranked) < requested_k)
+        diagnostics["effective_top_k"] = int(k)
+        initial_constraints = self.constraint_handler.evaluate_all(
+            current,
+            user_budget_info=user_budget_info,
+            alpha_inv=self.config.alpha_inv,
+            required_new_count=self.config.required_new_count,
+            min_sellers=self.config.min_sellers,
+            target_entropy_threshold=self.config.target_entropy_threshold,
+        )
+        diagnostics["initial_constraints"] = self._compact_constraint_result(initial_constraints)
+
+        # Step 3: 对列表级硬约束做贪心 swap 修复，先补新品，再补供应商多样性。
+        swap_log: List[Dict[str, Any]] = diagnostics["swap_log"]
+        current = self._repair_new_items(current, ranked, swap_log)
+        current = self._repair_seller_diversity(current, ranked, swap_log)
+        current = self._sort_candidates(current).head(k).reset_index(drop=True)
+
+        final_constraints = self.constraint_handler.evaluate_all(
+            current,
+            user_budget_info=user_budget_info,
+            alpha_inv=self.config.alpha_inv,
+            required_new_count=self.config.required_new_count,
+            min_sellers=self.config.min_sellers,
+            target_entropy_threshold=self.config.target_entropy_threshold,
+        )
+        diagnostics["final_constraints"] = self._compact_constraint_result(final_constraints)
+        diagnostics["fully_repaired"] = bool(final_constraints.get("all_hard_constraints_satisfied", False))
+        diagnostics["num_swaps"] = int(len(swap_log))
+        diagnostics["final_new_item_count"] = int(final_constraints.get("new_item_count", 0))
+        diagnostics["final_seller_count"] = int(final_constraints.get("seller_count", 0))
+        diagnostics["final_budget_penalty"] = float(final_constraints.get("budget_penalty", 0.0))
+        diagnostics["final_entropy_penalty"] = float(final_constraints.get("entropy_penalty", 0.0))
+        diagnostics["final_augmented_lagrangian_penalty"] = float(
+            final_constraints.get("augmented_lagrangian_penalty", 0.0)
+        )
+
+        return {
+            "recommendations": current,
+            "item_ids": current["item_id"].tolist(),
+            "diagnostics": diagnostics,
         }

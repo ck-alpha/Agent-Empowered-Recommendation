@@ -2,10 +2,18 @@
 Constraint handling module for DualAgent-Rec.
 """
 
-from .constraint_handler import ConstraintConfig, ConstraintHandler, AdaptiveConstraintHandler
+from .constraint_handler import (
+    ConstraintConfig,
+    ConstraintHandler,
+    AdaptiveConstraintHandler,
+    EcommerceConstraintConfig,
+    EcommerceConstraintHandler,
+)
 
 __all__ = [
     'ConstraintConfig',
     'ConstraintHandler',
     'AdaptiveConstraintHandler',
+    'EcommerceConstraintConfig',
+    'EcommerceConstraintHandler',
 ]
