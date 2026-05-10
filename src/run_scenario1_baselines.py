@@ -29,9 +29,10 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,7 +47,12 @@ except ImportError:  # pragma: no cover - exercised only when optional dependenc
 # Allow running as: python src/run_scenario1_baselines.py
 sys.path.insert(0, os.path.dirname(__file__))
 
-from agents import EcommercePostProcessingAgent, EcommercePostProcessingConfig
+from agents import (
+    EcommerceInProcessingAgent,
+    EcommerceInProcessingConfig,
+    EcommercePostProcessingAgent,
+    EcommercePostProcessingConfig,
+)
 
 LOGGER = logging.getLogger(__name__)
 RANDOM_SEED = 42
@@ -82,10 +88,27 @@ class UserHistoryProfile:
 
 
 @dataclass
+class RecallCache:
+    """Precomputed item indexes for fast large-catalog recall."""
+
+    items_by_id: pd.DataFrame
+    all_item_ids_np: np.ndarray
+    popular_item_ids_np: np.ndarray
+    popular_scores_np: np.ndarray
+    price_sorted_item_ids: np.ndarray
+    price_sorted_prices: np.ndarray
+    price_sorted_popularity: np.ndarray
+    brand_to_items: Dict[str, Tuple[np.ndarray, np.ndarray]]
+    seller_to_items: Dict[str, Tuple[np.ndarray, np.ndarray]]
+    global_median_price: float
+
+
+@dataclass
 class EvalRecord:
     """Per-user evaluation record for final aggregation and plotting."""
 
     strategy: str
+    method: str
     user_id: str
     ground_truth_item_id: str
     recall_count: int
@@ -97,6 +120,7 @@ class EvalRecord:
     agent_inventory_safety_rate: float
     fully_repaired: bool
     num_swaps: int
+    search_steps: int
     budget_penalty: float
     entropy_penalty: float
     final_new_item_count: int
@@ -126,18 +150,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed for sampling, BPR, and random recall.")
     parser.add_argument("--min_user_interactions", type=int, default=3, help="Minimum interactions before temporal split.")
     parser.add_argument(
+        "--recall_backend",
+        choices=["legacy", "fast"],
+        default="fast",
+        help="Recall implementation backend. Use legacy to reproduce prior Beauty results; use fast for large catalogs.",
+    )
+    parser.add_argument(
         "--recall_strategy",
         choices=SINGLE_STRATEGIES + ["all"],
         default="hybrid",
         help="Recall strategy. Use 'all' to run the full comparison suite.",
     )
     parser.add_argument("--hybrid_bpr_weight", type=float, default=0.5, help="BPR weight in hybrid score fusion.")
+    parser.add_argument(
+        "--baseline_mode",
+        choices=["postprocessing", "inprocessing", "both"],
+        default="both",
+        help="Constrained baseline layer to evaluate.",
+    )
     parser.add_argument("--show_progress", action="store_true", help="Show implicit BPR training progress.")
     return parser.parse_args()
 
 
 def resolve_strategies(strategy: str) -> List[str]:
     return SINGLE_STRATEGIES.copy() if strategy == "all" else [strategy]
+
+
+def resolve_methods(baseline_mode: str) -> List[str]:
+    return ["postprocessing", "inprocessing"] if baseline_mode == "both" else [baseline_mode]
 
 
 def ensure_implicit_available(required: bool = True) -> None:
@@ -341,15 +381,66 @@ def build_item_catalog(items: pd.DataFrame, popularity_scores: pd.Series) -> pd.
     return catalog.sort_values(["item_popularity_norm", "item_id"], ascending=[False, True]).reset_index(drop=True)
 
 
-def build_train_history_by_user(train_df: pd.DataFrame) -> Dict[str, set]:
+def _build_group_index(catalog: pd.DataFrame, group_col: str) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """Build group -> popularity-sorted item arrays for fast history recall."""
+    index: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for group_id, group in catalog.groupby(group_col, sort=False):
+        if pd.isna(group_id):
+            continue
+        index[str(group_id)] = (
+            group["item_id"].astype(str).to_numpy(),
+            group["item_popularity_norm"].astype(float).to_numpy(),
+        )
+    return index
+
+
+def build_recall_cache(items: pd.DataFrame, popularity_scores: pd.Series) -> RecallCache:
+    """Precompute indexes that avoid per-user full-catalog scans in fast backend."""
+    catalog = build_item_catalog(items, popularity_scores)
+    items_by_id = items[REQUIRED_ITEM_COLUMNS].copy()
+    items_by_id["item_id"] = items_by_id["item_id"].astype(str)
+    items_by_id = items_by_id.drop_duplicates("item_id", keep="first").set_index("item_id", drop=False)
+
+    price_catalog = catalog.dropna(subset=["price_filled"]).copy()
+    price_catalog = price_catalog.sort_values(
+        ["price_filled", "item_popularity_norm", "item_id"],
+        ascending=[True, False, True],
+    )
+    global_median_price = float(price_catalog["price_filled"].median()) if not price_catalog.empty else 0.0
+
+    return RecallCache(
+        items_by_id=items_by_id,
+        all_item_ids_np=catalog["item_id"].astype(str).to_numpy(),
+        popular_item_ids_np=catalog["item_id"].astype(str).to_numpy(),
+        popular_scores_np=catalog["item_popularity_norm"].astype(float).to_numpy(),
+        price_sorted_item_ids=price_catalog["item_id"].astype(str).to_numpy(),
+        price_sorted_prices=price_catalog["price_filled"].astype(float).to_numpy(),
+        price_sorted_popularity=price_catalog["item_popularity_norm"].astype(float).to_numpy(),
+        brand_to_items=_build_group_index(catalog, "brand_id"),
+        seller_to_items=_build_group_index(catalog, "seller_id"),
+        global_median_price=global_median_price,
+    )
+
+
+def build_train_history_by_user(train_df: pd.DataFrame, target_users: Optional[set] = None) -> Dict[str, set]:
     """Build user -> seen item set for recall filtering."""
-    return train_df.groupby("user_id")["item_id"].agg(lambda values: set(map(str, values))).to_dict()
+    source = train_df
+    if target_users is not None:
+        source = train_df[train_df["user_id"].isin(target_users)]
+    return source.groupby("user_id")["item_id"].agg(lambda values: set(map(str, values))).to_dict()
 
 
-def build_user_history_profiles(train_df: pd.DataFrame, items: pd.DataFrame) -> Dict[str, UserHistoryProfile]:
+def build_user_history_profiles(
+    train_df: pd.DataFrame,
+    items: pd.DataFrame,
+    target_users: Optional[set] = None,
+) -> Dict[str, UserHistoryProfile]:
     """Build user brand/seller profiles from training interactions only."""
     item_features = items[["item_id", "brand_id", "seller_id"]].copy()
-    merged = train_df[["user_id", "item_id"]].merge(item_features, on="item_id", how="left")
+    source = train_df
+    if target_users is not None:
+        source = train_df[train_df["user_id"].isin(target_users)]
+    merged = source[["user_id", "item_id"]].merge(item_features, on="item_id", how="left")
     profiles: Dict[str, UserHistoryProfile] = {}
     for user_id, group in merged.groupby("user_id"):
         brand_ids = set(group["brand_id"].dropna().astype(str))
@@ -499,6 +590,190 @@ def recall_history_candidates(
     return matched.sort_values(["history_score", "item_id"], ascending=[False, True]).head(recall_k).reset_index(drop=True)
 
 
+def _select_unseen_from_arrays(
+    item_ids: np.ndarray,
+    scores: np.ndarray,
+    seen: set,
+    recall_k: int,
+) -> Tuple[List[str], List[float]]:
+    selected_items: List[str] = []
+    selected_scores: List[float] = []
+    for item_id, score in zip(item_ids, scores):
+        item_id = str(item_id)
+        if item_id in seen:
+            continue
+        selected_items.append(item_id)
+        selected_scores.append(float(score))
+        if len(selected_items) >= recall_k:
+            break
+    return selected_items, selected_scores
+
+
+def recall_pop_candidates_fast(
+    user_id: str,
+    train_by_user: Mapping[str, set],
+    recall_cache: RecallCache,
+    recall_k: int,
+) -> pd.DataFrame:
+    """Fast popularity recall from pre-sorted arrays."""
+    seen = train_by_user.get(user_id, set())
+    item_ids, scores = _select_unseen_from_arrays(
+        recall_cache.popular_item_ids_np,
+        recall_cache.popular_scores_np,
+        seen,
+        recall_k,
+    )
+    return pd.DataFrame({"item_id": item_ids, "pop_score": scores})
+
+
+def recall_random_candidates_fast(
+    user_id: str,
+    train_by_user: Mapping[str, set],
+    recall_cache: RecallCache,
+    recall_k: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Fast deterministic random recall without per-user full-catalog filtering."""
+    all_items = recall_cache.all_item_ids_np
+    if len(all_items) == 0:
+        return pd.DataFrame(columns=["item_id", "random_score"])
+
+    seen = train_by_user.get(user_id, set())
+    rng = np.random.default_rng(_stable_user_seed(user_id, seed, "random_recall_fast"))
+    selected: List[str] = []
+    selected_set = set(seen)
+    batch_size = min(len(all_items), max(recall_k * 4, 1024))
+
+    for _ in range(10):
+        indices = rng.integers(0, len(all_items), size=batch_size)
+        for idx in indices:
+            item_id = str(all_items[int(idx)])
+            if item_id in selected_set:
+                continue
+            selected_set.add(item_id)
+            selected.append(item_id)
+            if len(selected) >= recall_k:
+                break
+        if len(selected) >= recall_k:
+            break
+
+    if len(selected) < recall_k:
+        filler_items, _ = _select_unseen_from_arrays(
+            recall_cache.popular_item_ids_np,
+            recall_cache.popular_scores_np,
+            selected_set,
+            recall_k - len(selected),
+        )
+        selected.extend(filler_items)
+
+    scores = rng.random(size=len(selected))
+    return pd.DataFrame({"item_id": selected, "random_score": scores})
+
+
+def recall_budget_candidates_fast(
+    user_id: str,
+    train_by_user: Mapping[str, set],
+    recall_cache: RecallCache,
+    user_budget_info: pd.Series,
+    recall_k: int,
+) -> pd.DataFrame:
+    """Fast budget recall from a price-neighborhood window instead of full catalog scans."""
+    seen = train_by_user.get(user_id, set())
+    target = float(pd.to_numeric(pd.Series([user_budget_info.get("target_budget", np.nan)]), errors="coerce").iloc[0])
+    tolerance = float(pd.to_numeric(pd.Series([user_budget_info.get("budget_tolerance", np.nan)]), errors="coerce").iloc[0])
+    if not np.isfinite(target):
+        target = recall_cache.global_median_price
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        tolerance = max(abs(target) * 0.2, 1.0)
+
+    prices = recall_cache.price_sorted_prices
+    if len(prices) == 0:
+        return pd.DataFrame(columns=["item_id", "budget_score"])
+
+    pool_size = min(len(prices), max(recall_k * 25, 5000))
+    center = int(np.searchsorted(prices, target, side="left"))
+    start = max(0, center - pool_size // 2)
+    end = min(len(prices), start + pool_size)
+    start = max(0, end - pool_size)
+
+    item_ids = recall_cache.price_sorted_item_ids[start:end]
+    window_prices = prices[start:end]
+    popularity = recall_cache.price_sorted_popularity[start:end]
+    rows: List[Tuple[str, float]] = []
+    for item_id, price, pop_score in zip(item_ids, window_prices, popularity):
+        item_id = str(item_id)
+        if item_id in seen:
+            continue
+        price_affinity = 1.0 / (1.0 + abs(float(price) - target) / (tolerance + EPS))
+        budget_score = 0.75 * price_affinity + 0.25 * float(pop_score)
+        rows.append((item_id, budget_score))
+
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    if len(rows) < recall_k:
+        selected = {item_id for item_id, _ in rows}
+        fallback_seen = set(seen) | selected
+        filler_items, filler_scores = _select_unseen_from_arrays(
+            recall_cache.popular_item_ids_np,
+            recall_cache.popular_scores_np,
+            fallback_seen,
+            recall_k - len(rows),
+        )
+        rows.extend((item_id, 0.25 * score) for item_id, score in zip(filler_items, filler_scores))
+
+    return pd.DataFrame(rows[:recall_k], columns=["item_id", "budget_score"])
+
+
+def recall_history_candidates_fast(
+    user_id: str,
+    train_by_user: Mapping[str, set],
+    recall_cache: RecallCache,
+    user_profiles: Mapping[str, UserHistoryProfile],
+    recall_k: int,
+) -> pd.DataFrame:
+    """Fast history recall from brand/seller inverted indexes."""
+    profile = user_profiles.get(user_id, UserHistoryProfile(brand_ids=set(), seller_ids=set()))
+    seen = train_by_user.get(user_id, set())
+    per_group_limit = max(recall_k * 5, 1000)
+    components: Dict[str, List[float]] = {}
+
+    def add_group(group_index: Mapping[str, Tuple[np.ndarray, np.ndarray]], group_ids: set, component_idx: int) -> None:
+        for group_id in group_ids:
+            ids_scores = group_index.get(str(group_id))
+            if ids_scores is None:
+                continue
+            item_ids, pop_scores = ids_scores
+            for item_id, pop_score in zip(item_ids[:per_group_limit], pop_scores[:per_group_limit]):
+                item_id = str(item_id)
+                if item_id in seen:
+                    continue
+                entry = components.setdefault(item_id, [0.0, 0.0, 0.0])
+                entry[component_idx] = 1.0
+                entry[2] = max(entry[2], float(pop_score))
+
+    add_group(recall_cache.brand_to_items, profile.brand_ids, 0)
+    add_group(recall_cache.seller_to_items, profile.seller_ids, 1)
+
+    rows = [
+        (item_id, 0.55 * values[0] + 0.35 * values[1] + 0.10 * values[2])
+        for item_id, values in components.items()
+    ]
+    rows = [row for row in rows if row[1] > 0.10]
+    rows.sort(key=lambda item: (-item[1], item[0]))
+
+    if len(rows) < recall_k:
+        selected = {item_id for item_id, _ in rows}
+        fallback_seen = set(seen) | selected
+        filler_items, filler_scores = _select_unseen_from_arrays(
+            recall_cache.popular_item_ids_np,
+            recall_cache.popular_scores_np,
+            fallback_seen,
+            recall_k - len(rows),
+        )
+        rows.extend((item_id, score) for item_id, score in zip(filler_items, filler_scores))
+
+    return pd.DataFrame(rows[:recall_k], columns=["item_id", "history_score"])
+
+
 def _merge_recall_sources(sources: Sequence[Tuple[pd.DataFrame, str, float]], recall_k: int) -> pd.DataFrame:
     merged: pd.DataFrame | None = None
     weighted_parts: List[pd.Series] = []
@@ -542,13 +817,22 @@ def recall_candidates(
     recall_k: int,
     hybrid_bpr_weight: float,
     seed: int,
+    recall_backend: str = "legacy",
+    recall_cache: Optional[RecallCache] = None,
 ) -> pd.DataFrame:
     """Recall candidates using one of the supported strategies."""
     hybrid_bpr_weight = min(1.0, max(0.0, float(hybrid_bpr_weight)))
     pop_weight = 1.0 - hybrid_bpr_weight
+    use_fast = recall_backend == "fast"
+    if use_fast and recall_cache is None:
+        raise ValueError("Fast recall backend requires a RecallCache.")
 
     if strategy == "random":
-        random_df = recall_random_candidates(user_id, train_by_user, item_catalog, recall_k, seed)
+        random_df = (
+            recall_random_candidates_fast(user_id, train_by_user, recall_cache, recall_k, seed)
+            if use_fast
+            else recall_random_candidates(user_id, train_by_user, item_catalog, recall_k, seed)
+        )
         if random_df.empty:
             return _empty_recall()
         random_df["base_score"] = _rank_fallback_score(random_df, "random_score")
@@ -562,21 +846,33 @@ def recall_candidates(
         return _finalize_recall(bpr_df, recall_k)
 
     if strategy == "pop":
-        pop_df = recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
+        pop_df = (
+            recall_pop_candidates_fast(user_id, train_by_user, recall_cache, recall_k)
+            if use_fast
+            else recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
+        )
         if pop_df.empty:
             return _empty_recall()
         pop_df["base_score"] = _rank_fallback_score(pop_df, "pop_score")
         return _finalize_recall(pop_df, recall_k)
 
     if strategy == "budget":
-        budget_df = recall_budget_candidates(user_id, train_by_user, item_catalog, user_budget_info, recall_k)
+        budget_df = (
+            recall_budget_candidates_fast(user_id, train_by_user, recall_cache, user_budget_info, recall_k)
+            if use_fast
+            else recall_budget_candidates(user_id, train_by_user, item_catalog, user_budget_info, recall_k)
+        )
         if budget_df.empty:
             return _empty_recall()
         budget_df["base_score"] = _rank_fallback_score(budget_df, "budget_score")
         return _finalize_recall(budget_df, recall_k)
 
     if strategy == "history":
-        history_df = recall_history_candidates(user_id, train_by_user, item_catalog, user_profiles, popularity_scores, recall_k)
+        history_df = (
+            recall_history_candidates_fast(user_id, train_by_user, recall_cache, user_profiles, recall_k)
+            if use_fast
+            else recall_history_candidates(user_id, train_by_user, item_catalog, user_profiles, popularity_scores, recall_k)
+        )
         if history_df.empty:
             return _empty_recall()
         history_df["base_score"] = _rank_fallback_score(history_df, "history_score")
@@ -584,7 +880,11 @@ def recall_candidates(
 
     if strategy == "hybrid":
         bpr_df = recall_bpr_candidates(model, user_id, mappings, user_item_matrix, recall_k)
-        pop_df = recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
+        pop_df = (
+            recall_pop_candidates_fast(user_id, train_by_user, recall_cache, recall_k)
+            if use_fast
+            else recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
+        )
         return _merge_recall_sources(
             [(bpr_df, "bpr_score", hybrid_bpr_weight), (pop_df, "pop_score", pop_weight)],
             recall_k,
@@ -592,9 +892,14 @@ def recall_candidates(
 
     if strategy == "ensemble":
         bpr_df = recall_bpr_candidates(model, user_id, mappings, user_item_matrix, recall_k)
-        pop_df = recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
-        budget_df = recall_budget_candidates(user_id, train_by_user, item_catalog, user_budget_info, recall_k)
-        history_df = recall_history_candidates(user_id, train_by_user, item_catalog, user_profiles, popularity_scores, recall_k)
+        if use_fast:
+            pop_df = recall_pop_candidates_fast(user_id, train_by_user, recall_cache, recall_k)
+            budget_df = recall_budget_candidates_fast(user_id, train_by_user, recall_cache, user_budget_info, recall_k)
+            history_df = recall_history_candidates_fast(user_id, train_by_user, recall_cache, user_profiles, recall_k)
+        else:
+            pop_df = recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
+            budget_df = recall_budget_candidates(user_id, train_by_user, item_catalog, user_budget_info, recall_k)
+            history_df = recall_history_candidates(user_id, train_by_user, item_catalog, user_profiles, popularity_scores, recall_k)
         return _merge_recall_sources(
             [
                 (bpr_df, "bpr_score", 0.35),
@@ -608,14 +913,28 @@ def recall_candidates(
     raise ValueError(f"Unsupported recall strategy: {strategy}")
 
 
-def build_candidate_dataframe(recall_df: pd.DataFrame, items: pd.DataFrame) -> pd.DataFrame:
+def build_candidate_dataframe(
+    recall_df: pd.DataFrame,
+    items: pd.DataFrame,
+    recall_cache: Optional[RecallCache] = None,
+) -> pd.DataFrame:
     """Join recall scores with scenario-1 item features."""
     if recall_df.empty:
         return pd.DataFrame(columns=REQUIRED_ITEM_COLUMNS + ["base_score"])
 
-    item_features = items[REQUIRED_ITEM_COLUMNS].copy()
-    candidates = recall_df.merge(item_features, on="item_id", how="inner")
-    missing_after_merge = len(recall_df) - len(candidates)
+    recall = recall_df.copy()
+    recall["item_id"] = recall["item_id"].astype(str)
+    if recall_cache is not None:
+        features = recall_cache.items_by_id.reindex(recall["item_id"].to_numpy())
+        missing_mask = features["item_id"].isna().to_numpy()
+        feature_values = features.reset_index(drop=True).drop(columns=["item_id"])
+        candidates = pd.concat([recall.reset_index(drop=True), feature_values], axis=1)
+        candidates = candidates.loc[~missing_mask].copy()
+    else:
+        item_features = items[REQUIRED_ITEM_COLUMNS].copy()
+        candidates = recall.merge(item_features, on="item_id", how="inner")
+
+    missing_after_merge = len(recall) - len(candidates)
     if missing_after_merge > 0:
         LOGGER.debug("Dropped %s recalled items missing synthesized features.", missing_after_merge)
 
@@ -675,6 +994,7 @@ def evaluate_raw_topk(
 
 def run_reranking_evaluation(
     strategy: str,
+    methods: Sequence[str],
     model: Any,
     sampled_test: pd.DataFrame,
     items: pd.DataFrame,
@@ -689,15 +1009,24 @@ def run_reranking_evaluation(
     top_k: int,
     hybrid_bpr_weight: float,
     seed: int,
+    recall_backend: str,
+    recall_cache: Optional[RecallCache],
 ) -> List[EvalRecord]:
-    """Run recall and constrained post-processing for sampled users."""
+    """Run recall and constrained processing baselines for sampled users."""
     users_by_id = users.set_index("user_id", drop=False)
-    agent = EcommercePostProcessingAgent(EcommercePostProcessingConfig(top_k=top_k))
+    agents = {
+        "postprocessing": EcommercePostProcessingAgent(EcommercePostProcessingConfig(top_k=top_k)),
+        "inprocessing": EcommerceInProcessingAgent(EcommerceInProcessingConfig(top_k=top_k, random_seed=seed)),
+    }
+    selected_methods = [method for method in methods if method in agents]
+    if not selected_methods:
+        raise ValueError(f"No supported baseline methods selected: {methods}")
+
     records: List[EvalRecord] = []
     skipped_no_budget = 0
     skipped_no_recall = 0
 
-    desc = f"Evaluating users [{strategy}]"
+    desc = f"Evaluating users [{strategy} | {','.join(selected_methods)}]"
     for row in tqdm(sampled_test.itertuples(index=False), total=len(sampled_test), desc=desc):
         user_id = str(row.user_id)
         ground_truth = str(row.item_id)
@@ -721,12 +1050,18 @@ def run_reranking_evaluation(
             recall_k=recall_k,
             hybrid_bpr_weight=hybrid_bpr_weight,
             seed=seed,
+            recall_backend=recall_backend,
+            recall_cache=recall_cache,
         )
         if recall_df.empty:
             skipped_no_recall += 1
             continue
 
-        candidate_df = build_candidate_dataframe(recall_df, items)
+        candidate_df = build_candidate_dataframe(
+            recall_df,
+            items,
+            recall_cache=recall_cache if recall_backend == "fast" else None,
+        )
         if candidate_df.empty:
             skipped_no_recall += 1
             continue
@@ -737,44 +1072,48 @@ def run_reranking_evaluation(
             ground_truth_item_id=ground_truth,
             top_k=top_k,
         )
-        result = agent.recommend(
-            user_id=user_id,
-            candidate_items=candidate_df,
-            user_budget_info=user_budget_info,
-            top_k=top_k,
-        )
-        diagnostics = result.get("diagnostics", {})
-        final_items = [str(item_id) for item_id in result.get("item_ids", [])]
-        final_hr, final_ndcg = compute_hr_ndcg_at_k(final_items, ground_truth, top_k)
         recall_hr, _ = compute_hr_ndcg_at_k(recall_df["item_id"].astype(str).tolist(), ground_truth, recall_k)
 
-        final_constraints = diagnostics.get("final_constraints", {})
-        agent_inventory_safety_rate = float(final_constraints.get("inventory_pass_rate", 0.0))
-
-        records.append(
-            EvalRecord(
-                strategy=strategy,
+        for method in selected_methods:
+            result = agents[method].recommend(
                 user_id=user_id,
-                ground_truth_item_id=ground_truth,
-                recall_count=int(len(recall_df)),
-                recall_hit_at_k=float(recall_hr),
-                raw_top10_hit_at_10=float(raw_eval["hit_at_10"]),
-                raw_top10_ndcg_at_10=float(raw_eval["ndcg_at_10"]),
-                raw_top10_inventory_safety_rate=float(raw_eval["inventory_safety_rate"]),
-                raw_top10_fully_repaired=bool(raw_eval["fully_repaired"]),
-                agent_inventory_safety_rate=float(agent_inventory_safety_rate),
-                fully_repaired=bool(diagnostics.get("fully_repaired", False)),
-                num_swaps=int(diagnostics.get("num_swaps", 0)),
-                budget_penalty=float(diagnostics.get("final_budget_penalty", 0.0)),
-                entropy_penalty=float(diagnostics.get("final_entropy_penalty", 0.0)),
-                final_new_item_count=int(diagnostics.get("final_new_item_count", 0)),
-                final_seller_count=int(diagnostics.get("final_seller_count", 0)),
-                candidate_shortage=bool(diagnostics.get("candidate_shortage", False)),
-                final_list_size=len(final_items),
-                final_hit_at_10=float(final_hr),
-                final_ndcg_at_10=float(final_ndcg),
+                candidate_items=candidate_df,
+                user_budget_info=user_budget_info,
+                top_k=top_k,
             )
-        )
+            diagnostics = result.get("diagnostics", {})
+            final_items = [str(item_id) for item_id in result.get("item_ids", [])]
+            final_hr, final_ndcg = compute_hr_ndcg_at_k(final_items, ground_truth, top_k)
+
+            final_constraints = diagnostics.get("final_constraints", {})
+            agent_inventory_safety_rate = float(final_constraints.get("inventory_pass_rate", 0.0))
+
+            records.append(
+                EvalRecord(
+                    strategy=strategy,
+                    method=method,
+                    user_id=user_id,
+                    ground_truth_item_id=ground_truth,
+                    recall_count=int(len(recall_df)),
+                    recall_hit_at_k=float(recall_hr),
+                    raw_top10_hit_at_10=float(raw_eval["hit_at_10"]),
+                    raw_top10_ndcg_at_10=float(raw_eval["ndcg_at_10"]),
+                    raw_top10_inventory_safety_rate=float(raw_eval["inventory_safety_rate"]),
+                    raw_top10_fully_repaired=bool(raw_eval["fully_repaired"]),
+                    agent_inventory_safety_rate=float(agent_inventory_safety_rate),
+                    fully_repaired=bool(diagnostics.get("fully_repaired", False)),
+                    num_swaps=int(diagnostics.get("num_swaps", 0)),
+                    search_steps=int(diagnostics.get("search_steps", 0)),
+                    budget_penalty=float(diagnostics.get("final_budget_penalty", 0.0)),
+                    entropy_penalty=float(diagnostics.get("final_entropy_penalty", 0.0)),
+                    final_new_item_count=int(diagnostics.get("final_new_item_count", 0)),
+                    final_seller_count=int(diagnostics.get("final_seller_count", 0)),
+                    candidate_shortage=bool(diagnostics.get("candidate_shortage", False)),
+                    final_list_size=len(final_items),
+                    final_hit_at_10=float(final_hr),
+                    final_ndcg_at_10=float(final_ndcg),
+                )
+            )
 
     if skipped_no_budget:
         LOGGER.warning("[%s] Skipped %s users because budget features were missing.", strategy, skipped_no_budget)
@@ -796,6 +1135,7 @@ def _mean_dict(records: List[EvalRecord]) -> Dict[str, float]:
         "agent_inventory_safety_rate",
         "fully_repaired",
         "num_swaps",
+        "search_steps",
         "budget_penalty",
         "entropy_penalty",
         "final_new_item_count",
@@ -808,15 +1148,25 @@ def _mean_dict(records: List[EvalRecord]) -> Dict[str, float]:
     return {key: float(np.mean([getattr(record, key) for record in records])) for key in keys}
 
 
-def make_summary(records: List[EvalRecord], strategy: str, recall_k: int, top_k: int, hybrid_bpr_weight: float) -> Dict[str, Any]:
+def make_summary(
+    records: List[EvalRecord],
+    strategy: str,
+    method: Optional[str],
+    recall_k: int,
+    top_k: int,
+    hybrid_bpr_weight: float,
+    recall_backend: str,
+) -> Dict[str, Any]:
     summary = _mean_dict(records)
     summary.update(
         {
             "num_users": len(records),
             "recall_strategy": strategy,
+            "method": method or "mixed",
             "recall_k": recall_k,
             "top_k": top_k,
             "hybrid_bpr_weight": hybrid_bpr_weight,
+            "recall_backend": recall_backend,
         }
     )
     return summary
@@ -833,6 +1183,8 @@ def log_final_report(summary: Dict[str, Any], recall_k: int, top_k: int) -> None
     LOGGER.info("%s", "=" * 78)
     LOGGER.info("Evaluated users                    : %d", int(summary.get("num_users", 0)))
     LOGGER.info("Recall strategy                    : %s", summary.get("recall_strategy"))
+    LOGGER.info("Baseline method                    : %s", summary.get("method", "unknown"))
+    LOGGER.info("Recall backend                     : %s", summary.get("recall_backend"))
     LOGGER.info("Recall K / Final K                 : %d / %d", recall_k, top_k)
     LOGGER.info("Mean recall count                  : %.4f", summary.get("recall_count", 0.0))
     LOGGER.info("Hit Rate@%d (Recall)               : %.4f", recall_k, summary.get("recall_hit_at_k", 0.0))
@@ -845,6 +1197,7 @@ def log_final_report(summary: Dict[str, Any], recall_k: int, top_k: int) -> None
     LOGGER.info("Recall-layer inventory safety      : %.4f", summary.get("raw_top10_inventory_safety_rate", 0.0))
     LOGGER.info("Agent inventory safety             : %.4f", summary.get("agent_inventory_safety_rate", 0.0))
     LOGGER.info("Average swaps                      : %.4f", summary.get("num_swaps", 0.0))
+    LOGGER.info("Average search steps               : %.4f", summary.get("search_steps", 0.0))
     LOGGER.info("Mean budget penalty                : %.4f", summary.get("budget_penalty", 0.0))
     LOGGER.info("Mean entropy penalty               : %.4f", summary.get("entropy_penalty", 0.0))
     LOGGER.info("Mean final new item count          : %.4f", summary.get("final_new_item_count", 0.0))
@@ -859,6 +1212,8 @@ def save_metrics_json(
     records: List[EvalRecord],
     summary: Dict[str, Any],
     summaries_by_strategy: Dict[str, Dict[str, Any]],
+    summaries_by_method_strategy: Optional[Dict[str, Dict[str, Any]]] = None,
+    completed_strategies: Optional[Sequence[str]] = None,
 ) -> None:
     """Persist per-user records and aggregate summary for plotting."""
     output_path = Path(output_json)
@@ -867,6 +1222,8 @@ def save_metrics_json(
         "config": vars(args),
         "summary": summary,
         "summaries_by_strategy": summaries_by_strategy,
+        "summaries_by_method_strategy": summaries_by_method_strategy or {},
+        "completed_strategies": list(completed_strategies or summaries_by_strategy.keys()),
         "records": [asdict(record) for record in records],
     }
     with output_path.open("w", encoding="utf-8") as f:
@@ -879,6 +1236,7 @@ def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
     strategies = resolve_strategies(args.recall_strategy)
+    methods = resolve_methods(args.baseline_mode)
 
     if any(strategy in BPR_STRATEGIES for strategy in strategies):
         try:
@@ -892,10 +1250,18 @@ def main() -> None:
     mappings = build_id_mappings(train_df)
     user_item_matrix = build_user_item_matrix(train_df, mappings)
     sampled_test = sample_test_users(test_df, mappings, args.test_users, args.seed)
+    sampled_user_ids = set(sampled_test["user_id"].astype(str))
     popularity_scores = build_popularity_scores(train_df)
-    train_by_user = build_train_history_by_user(train_df)
-    item_catalog = build_item_catalog(items, popularity_scores)
-    user_profiles = build_user_history_profiles(train_df, items)
+    train_by_user = build_train_history_by_user(train_df, sampled_user_ids)
+    if args.recall_backend == "fast":
+        LOGGER.info("Building fast recall cache.")
+        recall_cache = build_recall_cache(items, popularity_scores)
+        item_catalog = pd.DataFrame()
+    else:
+        LOGGER.info("Using legacy recall backend.")
+        recall_cache = None
+        item_catalog = build_item_catalog(items, popularity_scores)
+    user_profiles = build_user_history_profiles(train_df, items, sampled_user_ids)
 
     model = None
     if any(strategy in BPR_STRATEGIES for strategy in strategies):
@@ -909,10 +1275,14 @@ def main() -> None:
 
     all_records: List[EvalRecord] = []
     summaries_by_strategy: Dict[str, Dict[str, Any]] = {}
+    summaries_by_method_strategy: Dict[str, Dict[str, Any]] = {}
+    completed_strategies: List[str] = []
     for strategy in strategies:
         LOGGER.info("Running scenario-1 recall strategy: %s", strategy)
+        strategy_start = time.time()
         strategy_records = run_reranking_evaluation(
             strategy=strategy,
+            methods=methods,
             model=model,
             sampled_test=sampled_test,
             items=items,
@@ -927,26 +1297,89 @@ def main() -> None:
             top_k=args.top_k,
             hybrid_bpr_weight=args.hybrid_bpr_weight,
             seed=args.seed,
+            recall_backend=args.recall_backend,
+            recall_cache=recall_cache,
         )
-        strategy_summary = make_summary(
-            strategy_records,
-            strategy=strategy,
-            recall_k=args.recall_k,
-            top_k=args.top_k,
-            hybrid_bpr_weight=args.hybrid_bpr_weight,
-        )
+        strategy_method_summaries: Dict[str, Dict[str, Any]] = {}
+        for method in methods:
+            method_records = [record for record in strategy_records if record.method == method]
+            method_summary = make_summary(
+                method_records,
+                strategy=strategy,
+                method=method,
+                recall_k=args.recall_k,
+                top_k=args.top_k,
+                hybrid_bpr_weight=args.hybrid_bpr_weight,
+                recall_backend=args.recall_backend,
+            )
+            strategy_method_summaries[method] = method_summary
+            summaries_by_method_strategy[f"{method}::{strategy}"] = method_summary
+
+        primary_method = "postprocessing" if "postprocessing" in strategy_method_summaries else methods[0]
+        strategy_summary = strategy_method_summaries[primary_method]
         summaries_by_strategy[strategy] = strategy_summary
+        completed_strategies.append(strategy)
         log_final_report(strategy_summary, args.recall_k, args.top_k)
         all_records.extend(strategy_records)
+        LOGGER.info("Finished strategy %s in %.2f seconds.", strategy, time.time() - strategy_start)
+
+        checkpoint_summary = dict(strategy_summary)
+        if len(strategies) > 1:
+            checkpoint_summary.update(
+                {
+                    "recall_strategy": args.recall_strategy,
+                    "primary_strategy": strategy,
+                    "num_strategies": len(strategies),
+                    "completed_strategy_count": len(completed_strategies),
+                    "recall_backend": args.recall_backend,
+                }
+            )
+        save_metrics_json(
+            args.output_json,
+            args,
+            all_records,
+            checkpoint_summary,
+            summaries_by_strategy,
+            summaries_by_method_strategy=summaries_by_method_strategy,
+            completed_strategies=completed_strategies,
+        )
 
     if len(strategies) == 1:
         summary = summaries_by_strategy[strategies[0]]
     else:
-        summary = summaries_by_strategy.get("ensemble", make_summary(all_records, "all", args.recall_k, args.top_k, args.hybrid_bpr_weight))
+        primary_method = "postprocessing" if "postprocessing" in methods else methods[0]
+        summary = summaries_by_strategy.get(
+            "ensemble",
+            make_summary(
+                [record for record in all_records if record.method == primary_method],
+                "all",
+                primary_method,
+                args.recall_k,
+                args.top_k,
+                args.hybrid_bpr_weight,
+                args.recall_backend,
+            ),
+        )
         summary = dict(summary)
-        summary.update({"recall_strategy": args.recall_strategy, "primary_strategy": "ensemble", "num_strategies": len(strategies)})
+        summary.update(
+            {
+                "recall_strategy": args.recall_strategy,
+                "primary_strategy": "ensemble",
+                "num_strategies": len(strategies),
+                "completed_strategy_count": len(completed_strategies),
+                "recall_backend": args.recall_backend,
+            }
+        )
 
-    save_metrics_json(args.output_json, args, all_records, summary, summaries_by_strategy)
+    save_metrics_json(
+        args.output_json,
+        args,
+        all_records,
+        summary,
+        summaries_by_strategy,
+        summaries_by_method_strategy=summaries_by_method_strategy,
+        completed_strategies=completed_strategies,
+    )
 
 
 if __name__ == "__main__":

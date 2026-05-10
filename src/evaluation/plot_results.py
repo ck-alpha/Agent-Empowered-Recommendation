@@ -24,6 +24,8 @@ import seaborn as sns
 
 LOGGER = logging.getLogger(__name__)
 STRATEGY_ORDER = ["random", "pop", "bpr", "hybrid", "budget", "history", "ensemble"]
+METHOD_ORDER = ["postprocessing", "inprocessing"]
+METHOD_LABELS = {"postprocessing": "Post", "inprocessing": "In"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,31 +50,71 @@ def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Da
 
     summary = payload.get("summary", {})
     summaries_by_strategy = payload.get("summaries_by_strategy", {})
+    summaries_by_method_strategy = payload.get("summaries_by_method_strategy", {})
     records = payload.get("records", [])
     if not summary:
         raise ValueError("Metrics JSON missing non-empty 'summary'.")
     if not records:
         raise ValueError("Metrics JSON missing non-empty 'records'.")
 
-    if summaries_by_strategy:
+    if summaries_by_method_strategy:
+        rows = []
+        for key, strategy_summary in summaries_by_method_strategy.items():
+            row = dict(strategy_summary)
+            if "method" not in row or "strategy" not in row:
+                if "::" in key:
+                    method, strategy = key.split("::", 1)
+                else:
+                    method, strategy = row.get("method", "postprocessing"), key
+                row.setdefault("method", method)
+                row.setdefault("strategy", strategy)
+            rows.append(row)
+        summary_df = pd.DataFrame(rows)
+    elif summaries_by_strategy:
         rows = []
         for strategy, strategy_summary in summaries_by_strategy.items():
             row = dict(strategy_summary)
             row["strategy"] = strategy
+            row.setdefault("method", row.get("method", "postprocessing"))
             rows.append(row)
         summary_df = pd.DataFrame(rows)
     else:
         row = dict(summary)
         row["strategy"] = row.get("recall_strategy", "strategy")
+        row.setdefault("method", row.get("method", "postprocessing"))
         summary_df = pd.DataFrame([row])
 
     records_df = pd.DataFrame(records)
     if "strategy" not in records_df.columns:
         records_df["strategy"] = summary.get("recall_strategy", "strategy")
+    if "method" not in records_df.columns:
+        records_df["method"] = summary.get("method", "postprocessing")
+    if "search_steps" not in records_df.columns:
+        records_df["search_steps"] = 0
+
+    summary_df["method"] = summary_df["method"].fillna("postprocessing").astype(str)
+    records_df["method"] = records_df["method"].fillna("postprocessing").astype(str)
     summary_df["strategy"] = pd.Categorical(summary_df["strategy"], categories=STRATEGY_ORDER, ordered=True)
+    summary_df["method"] = pd.Categorical(summary_df["method"], categories=METHOD_ORDER, ordered=True)
     summary_df = summary_df.sort_values("strategy").reset_index(drop=True)
     records_df["strategy"] = pd.Categorical(records_df["strategy"], categories=STRATEGY_ORDER, ordered=True)
+    records_df["method"] = pd.Categorical(records_df["method"], categories=METHOD_ORDER, ordered=True)
+    summary_df = summary_df.sort_values(["strategy", "method"]).reset_index(drop=True)
+    summary_df["method_strategy"] = summary_df.apply(_method_strategy_label, axis=1)
+    records_df["method_strategy"] = records_df.apply(_method_strategy_label, axis=1)
     return summary, summary_df, records_df
+
+
+def _method_strategy_label(row: pd.Series) -> str:
+    method = str(row.get("method", "postprocessing"))
+    strategy = str(row.get("strategy", "strategy"))
+    if method in METHOD_LABELS:
+        return f"{METHOD_LABELS[method]}-{strategy}"
+    return strategy
+
+
+def _x_col(df: pd.DataFrame) -> str:
+    return "method_strategy" if "method" in df.columns and df["method"].nunique(dropna=True) > 1 else "strategy"
 
 
 def setup_style() -> None:
@@ -117,8 +159,9 @@ def plot_recall_accuracy_comparison(summary_df: pd.DataFrame, output_dir: Path, 
     if missing:
         raise ValueError(f"Summary missing keys required for accuracy plot: {missing}")
 
+    x_col = _x_col(summary_df)
     plot_df = _to_numeric(summary_df, required).melt(
-        id_vars="strategy",
+        id_vars=x_col,
         value_vars=required,
         var_name="Metric",
         value_name="Score",
@@ -131,10 +174,10 @@ def plot_recall_accuracy_comparison(summary_df: pd.DataFrame, output_dir: Path, 
     }
     plot_df["Metric"] = plot_df["Metric"].map(names)
 
-    fig, ax = plt.subplots(figsize=(8.0, 4.2))
-    sns.barplot(data=plot_df, x="strategy", y="Score", hue="Metric", ax=ax)
+    fig, ax = plt.subplots(figsize=(max(8.0, 0.72 * summary_df[x_col].nunique()), 4.2))
+    sns.barplot(data=plot_df, x=x_col, y="Score", hue="Metric", ax=ax)
     ax.set_title("Recall Strategy Accuracy Comparison")
-    ax.set_xlabel("Recall strategy")
+    ax.set_xlabel("Method / recall strategy" if x_col == "method_strategy" else "Recall strategy")
     ax.set_ylabel("Rate / NDCG")
     ax.set_ylim(0, max(0.05, float(plot_df["Score"].max()) * 1.25 if plot_df["Score"].notna().any() else 0.05))
     ax.legend(title="", loc="upper left", frameon=True)
@@ -154,8 +197,9 @@ def plot_constraint_by_strategy(summary_df: pd.DataFrame, output_dir: Path, fmt:
         raise ValueError(f"Summary missing keys required for constraint plot: {missing}")
 
     rows = []
+    x_col = _x_col(summary_df)
     for _, row in _to_numeric(summary_df, required).iterrows():
-        strategy = row["strategy"]
+        strategy = row[x_col]
         rows.extend(
             [
                 {"strategy": strategy, "Metric": "CSR", "Layer": "Raw Top-10", "Score": row["raw_top10_fully_repaired"]},
@@ -166,7 +210,7 @@ def plot_constraint_by_strategy(summary_df: pd.DataFrame, output_dir: Path, fmt:
         )
     plot_df = pd.DataFrame(rows)
 
-    fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.8), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(max(9.2, 0.78 * summary_df[x_col].nunique()), 3.8), sharey=True)
     palette = {"Raw Top-10": "#A9B4C2", "Agent Top-10": "#1F6F8B"}
     for ax, metric in zip(axes, ["CSR", "Inventory"]):
         sub = plot_df[plot_df["Metric"] == metric]
@@ -220,8 +264,9 @@ def plot_recall_funnel(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi
     missing = [col for col in required if col not in summary_df.columns]
     if missing:
         raise ValueError(f"Summary missing keys required for funnel plot: {missing}")
+    hue_col = _x_col(summary_df)
     plot_df = _to_numeric(summary_df, required).melt(
-        id_vars="strategy",
+        id_vars=hue_col,
         value_vars=required,
         var_name="Stage",
         value_name="Hit Rate",
@@ -234,18 +279,19 @@ def plot_recall_funnel(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi
         }
     )
     fig, ax = plt.subplots(figsize=(7.4, 4.0))
-    sns.lineplot(data=plot_df, x="Stage", y="Hit Rate", hue="strategy", marker="o", linewidth=2.0, ax=ax)
+    sns.lineplot(data=plot_df, x="Stage", y="Hit Rate", hue=hue_col, marker="o", linewidth=2.0, ax=ax)
     ax.set_title("Hit-Rate Funnel: Recall to Constrained Top-10")
     ax.set_xlabel("")
     ax.set_ylabel("Hit Rate")
     ax.set_ylim(0, max(0.05, float(plot_df["Hit Rate"].max()) * 1.25 if plot_df["Hit Rate"].notna().any() else 0.05))
-    ax.legend(title="Strategy", loc="upper right", frameon=True)
+    ax.legend(title="Method/Strategy" if hue_col == "method_strategy" else "Strategy", loc="upper right", frameon=True)
     return save_figure(fig, output_dir, "scenario1_recall_funnel", fmt, dpi)
 
 
 def plot_budget_ndcg_tradeoff(records: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
     """Scatter plot of Budget Penalty vs NDCG@10 with strategy-aware trend line."""
-    required = ["budget_penalty", "final_ndcg_at_10", "strategy"]
+    hue_col = _x_col(records)
+    required = ["budget_penalty", "final_ndcg_at_10", hue_col]
     missing = [key for key in required if key not in records.columns]
     if missing:
         raise ValueError(f"Records missing keys required for tradeoff plot: {missing}")
@@ -259,7 +305,7 @@ def plot_budget_ndcg_tradeoff(records: pd.DataFrame, output_dir: Path, fmt: str,
         data=plot_df,
         x="budget_penalty",
         y="final_ndcg_at_10",
-        hue="strategy",
+        hue=hue_col,
         s=18,
         alpha=0.30,
         linewidth=0,
@@ -311,12 +357,13 @@ def plot_budget_ndcg_tradeoff(records: pd.DataFrame, output_dir: Path, fmt: str,
     ax.set_xlabel("Budget Penalty (lower is better)")
     ax.set_ylabel("NDCG@10 (higher is better)")
     ax.set_ylim(-0.02, max(1.0, float(plot_df["final_ndcg_at_10"].max()) + 0.05))
-    ax.legend(title="Strategy", loc="upper right", frameon=True, ncols=2)
+    ax.legend(title="Method/Strategy" if hue_col == "method_strategy" else "Strategy", loc="upper right", frameon=True, ncols=2)
     return save_figure(fig, output_dir, "scenario1_budget_ndcg_tradeoff", fmt, dpi)
 
 
 def plot_swaps_vs_utility(records: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
-    required = ["strategy", "num_swaps", "final_ndcg_at_10", "final_hit_at_10"]
+    hue_col = _x_col(records)
+    required = [hue_col, "num_swaps", "final_ndcg_at_10", "final_hit_at_10"]
     missing = [key for key in required if key not in records.columns]
     if missing:
         raise ValueError(f"Records missing keys required for swaps plot: {missing}")
@@ -324,26 +371,64 @@ def plot_swaps_vs_utility(records: pd.DataFrame, output_dir: Path, fmt: str, dpi
     df = _to_numeric(records, ["num_swaps", "final_ndcg_at_10", "final_hit_at_10"])[required].dropna()
     if df.empty:
         raise ValueError("No valid rows for swaps/utility plot.")
-    grouped = df.groupby(["strategy", "num_swaps"], observed=True).agg(
+    grouped = df.groupby([hue_col, "num_swaps"], observed=True).agg(
         final_ndcg_at_10=("final_ndcg_at_10", "mean"),
         final_hit_at_10=("final_hit_at_10", "mean"),
         count=("final_hit_at_10", "size"),
     ).reset_index()
 
     fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.8), sharex=True)
-    sns.lineplot(data=grouped, x="num_swaps", y="final_ndcg_at_10", hue="strategy", marker="o", ax=axes[0])
+    sns.lineplot(data=grouped, x="num_swaps", y="final_ndcg_at_10", hue=hue_col, marker="o", ax=axes[0])
     axes[0].set_title("NDCG@10 by Repair Swaps")
     axes[0].set_xlabel("Number of swaps")
     axes[0].set_ylabel("Mean NDCG@10")
     axes[0].legend_.remove() if axes[0].legend_ else None
 
-    sns.lineplot(data=grouped, x="num_swaps", y="final_hit_at_10", hue="strategy", marker="o", ax=axes[1])
+    sns.lineplot(data=grouped, x="num_swaps", y="final_hit_at_10", hue=hue_col, marker="o", ax=axes[1])
     axes[1].set_title("Hit Rate@10 by Repair Swaps")
     axes[1].set_xlabel("Number of swaps")
     axes[1].set_ylabel("Mean HR@10")
-    axes[1].legend(title="Strategy", loc="upper right", frameon=True)
+    axes[1].legend(title="Method/Strategy" if hue_col == "method_strategy" else "Strategy", loc="upper right", frameon=True)
     fig.suptitle("Repair Intensity vs. Recommendation Utility", y=1.03, fontweight="bold")
     return save_figure(fig, output_dir, "scenario1_swaps_vs_utility", fmt, dpi)
+
+
+def plot_method_constraint_utility_comparison(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
+    required = ["method", "final_ndcg_at_10", "fully_repaired", "budget_penalty", "entropy_penalty"]
+    missing = [col for col in required if col not in summary_df.columns]
+    if missing:
+        raise ValueError(f"Summary missing keys required for method comparison plot: {missing}")
+    if summary_df["method"].nunique(dropna=True) < 2:
+        LOGGER.info("Skipping method comparison plot because the metrics JSON has one method.")
+        return output_dir / f"scenario1_method_constraint_utility_comparison.{fmt}"
+
+    metrics = ["final_ndcg_at_10", "fully_repaired", "budget_penalty", "entropy_penalty"]
+    plot_df = _to_numeric(summary_df, metrics).melt(
+        id_vars=["method", "strategy"],
+        value_vars=metrics,
+        var_name="Metric",
+        value_name="Score",
+    )
+    plot_df["method"] = plot_df["method"].map(lambda value: METHOD_LABELS.get(str(value), str(value)))
+    plot_df["Metric"] = plot_df["Metric"].map(
+        {
+            "final_ndcg_at_10": "NDCG@10",
+            "fully_repaired": "CSR",
+            "budget_penalty": "Budget penalty",
+            "entropy_penalty": "Entropy penalty",
+        }
+    )
+
+    fig, axes = plt.subplots(2, 2, figsize=(10.2, 6.6))
+    for ax, metric in zip(axes.ravel(), ["NDCG@10", "CSR", "Budget penalty", "Entropy penalty"]):
+        sub = plot_df[plot_df["Metric"] == metric]
+        sns.barplot(data=sub, x="strategy", y="Score", hue="method", ax=ax)
+        ax.set_title(metric)
+        ax.set_xlabel("")
+        ax.tick_params(axis="x", rotation=25)
+        ax.legend(title="Method", loc="best", frameon=True)
+    fig.suptitle("Method-Level Constraint and Utility Comparison", y=1.02, fontweight="bold")
+    return save_figure(fig, output_dir, "scenario1_method_constraint_utility_comparison", fmt, dpi)
 
 
 def main() -> None:
@@ -359,6 +444,7 @@ def main() -> None:
     plot_recall_funnel(summary_df, output_dir, args.format, args.dpi)
     plot_budget_ndcg_tradeoff(records, output_dir, args.format, args.dpi)
     plot_swaps_vs_utility(records, output_dir, args.format, args.dpi)
+    plot_method_constraint_utility_comparison(summary_df, output_dir, args.format, args.dpi)
 
 
 if __name__ == "__main__":

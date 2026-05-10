@@ -9,6 +9,7 @@ Includes:
 from __future__ import annotations
 
 import random
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
@@ -757,5 +758,340 @@ class EcommercePostProcessingAgent:
         return {
             "recommendations": current,
             "item_ids": current["item_id"].tolist(),
+            "diagnostics": diagnostics,
+        }
+
+
+@dataclass
+class EcommerceInProcessingConfig:
+    """Configuration for scenario-1 e-commerce in-processing baseline."""
+
+    top_k: int = 10
+    alpha_inv: float = 0.05
+    required_new_count: int = 2
+    min_sellers: int = 3
+    target_entropy_threshold: float = 1.5
+    lambda_budget: float = 1.0
+    lambda_entropy: float = 1.0
+    rho_budget: float = 1.0
+    rho_entropy: float = 1.0
+    base_score_col: str = "base_score"
+    population_size: int = 20
+    max_generations: int = 10
+    elite_size: int = 5
+    mutation_rate: float = 0.25
+    hard_violation_weight: float = 10.0
+    random_seed: int = RANDOM_SEED
+
+
+class EcommerceInProcessingAgent:
+    """
+    场景一电商中处理基线。
+
+    该 baseline 在召回候选集内直接搜索 Top-K 列表，并把场景一硬约束与 ALM
+    软约束放进适应度函数；它不调用后处理修复逻辑。
+    """
+
+    def __init__(self, config: Optional[EcommerceInProcessingConfig] = None):
+        self.config = config or EcommerceInProcessingConfig()
+        self.constraint_handler = EcommerceConstraintHandler(
+            EcommerceConstraintConfig(
+                alpha_inv=self.config.alpha_inv,
+                required_new_count=self.config.required_new_count,
+                min_sellers=self.config.min_sellers,
+                target_entropy_threshold=self.config.target_entropy_threshold,
+                lambda_budget=self.config.lambda_budget,
+                lambda_entropy=self.config.lambda_entropy,
+                rho_budget=self.config.rho_budget,
+                rho_entropy=self.config.rho_entropy,
+            )
+        )
+
+    @staticmethod
+    def _to_dataframe(candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]]) -> pd.DataFrame:
+        if isinstance(candidate_items, pd.DataFrame):
+            return candidate_items.copy()
+        if isinstance(candidate_items, list):
+            return pd.DataFrame(candidate_items).copy()
+        raise TypeError("candidate_items must be a pandas DataFrame or a list of dictionaries.")
+
+    @staticmethod
+    def _stable_seed(user_id: str, seed: int) -> int:
+        digest = hashlib.sha256(f"ecommerce_inprocessing:{seed}:{user_id}".encode("utf-8")).hexdigest()
+        return int(digest[:16], 16) % (2**32)
+
+    @staticmethod
+    def _compact_constraint_result(result: Dict[str, Any]) -> Dict[str, Any]:
+        compact = dict(result)
+        compact.pop("inventory_feasible_items", None)
+        return compact
+
+    def _prepare_candidates(self, candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]]) -> pd.DataFrame:
+        df = self._to_dataframe(candidate_items)
+        if "item_id" not in df.columns:
+            raise ValueError("candidate_items requires an item_id column.")
+        if self.config.base_score_col not in df.columns:
+            df[self.config.base_score_col] = 0.0
+
+        df = df.drop_duplicates("item_id", keep="first").copy()
+        df["item_id"] = df["item_id"].astype(str)
+        df[self.config.base_score_col] = pd.to_numeric(
+            df[self.config.base_score_col],
+            errors="coerce",
+        ).fillna(0.0).astype(float)
+        return df
+
+    def _sort_by_base_score(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df.copy()
+        return df.sort_values([self.config.base_score_col, "item_id"], ascending=[False, True]).reset_index(drop=True)
+
+    def _position_weighted_utility(self, slate: pd.DataFrame) -> float:
+        if slate.empty:
+            return 0.0
+        scores = pd.to_numeric(slate[self.config.base_score_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        weights = 1.0 / np.log2(np.arange(2, len(scores) + 2))
+        return float(np.sum(scores * weights) / np.sum(weights))
+
+    def _hard_violation(self, constraints: Mapping[str, Any], slate_size: int) -> float:
+        if slate_size <= 0:
+            return float(self.config.required_new_count + self.config.min_sellers + 1)
+        inventory_gap = 0.0 if constraints.get("inventory_satisfied", False) else 1.0
+        new_gap = max(0, self.config.required_new_count - int(constraints.get("new_item_count", 0))) / max(
+            1,
+            self.config.required_new_count,
+        )
+        seller_gap = max(0, self.config.min_sellers - int(constraints.get("seller_count", 0))) / max(1, self.config.min_sellers)
+        return float(inventory_gap + new_gap + seller_gap)
+
+    def _evaluate_slate(
+        self,
+        item_ids: List[str],
+        candidates_by_id: pd.DataFrame,
+        user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]],
+    ) -> Dict[str, Any]:
+        slate = candidates_by_id.loc[item_ids].copy().reset_index(drop=True)
+        constraints = self.constraint_handler.evaluate_all(
+            slate,
+            user_budget_info=user_budget_info,
+            alpha_inv=self.config.alpha_inv,
+            required_new_count=self.config.required_new_count,
+            min_sellers=self.config.min_sellers,
+            target_entropy_threshold=self.config.target_entropy_threshold,
+        )
+        utility = self._position_weighted_utility(slate)
+        hard_violation = self._hard_violation(constraints, len(slate))
+        alm_penalty = float(constraints.get("augmented_lagrangian_penalty", 0.0))
+        fitness = utility - alm_penalty - self.config.hard_violation_weight * hard_violation
+        feasible = bool(constraints.get("all_hard_constraints_satisfied", False))
+        return {
+            "item_ids": item_ids,
+            "slate": slate,
+            "constraints": constraints,
+            "utility": float(utility),
+            "hard_violation": float(hard_violation),
+            "alm_penalty": float(alm_penalty),
+            "fitness": float(fitness),
+            "feasible": feasible,
+        }
+
+    @staticmethod
+    def _dedupe_keep_order(items: List[str]) -> List[str]:
+        return list(dict.fromkeys(items))
+
+    def _complete_slate(self, seed_items: List[str], ranked_ids: List[str], k: int) -> List[str]:
+        selected = self._dedupe_keep_order(seed_items)[:k]
+        selected_set = set(selected)
+        for item_id in ranked_ids:
+            if item_id in selected_set:
+                continue
+            selected.append(item_id)
+            selected_set.add(item_id)
+            if len(selected) >= k:
+                break
+        return selected[:k]
+
+    def _initial_population(self, ranked: pd.DataFrame, k: int, rng: np.random.Generator) -> List[List[str]]:
+        ranked_ids = ranked["item_id"].astype(str).tolist()
+        population: List[List[str]] = [ranked_ids[:k]]
+
+        budget_ranked = ranked.copy()
+        if "price_filled" in budget_ranked.columns:
+            budget_ranked["_price_valid"] = pd.to_numeric(budget_ranked["price_filled"], errors="coerce").notna()
+            budget_ranked = budget_ranked.sort_values(
+                ["_price_valid", self.config.base_score_col, "item_id"],
+                ascending=[False, False, True],
+            )
+            population.append(self._complete_slate(budget_ranked["item_id"].astype(str).tolist()[:k], ranked_ids, k))
+
+        if "is_new" in ranked.columns:
+            new_first = ranked.sort_values(
+                ["is_new", self.config.base_score_col, "item_id"],
+                ascending=[False, False, True],
+            )["item_id"].astype(str).tolist()
+            population.append(self._complete_slate(new_first[:k], ranked_ids, k))
+
+        if "seller_id" in ranked.columns:
+            seller_seed: List[str] = []
+            seen_sellers = set()
+            for row in ranked.itertuples(index=False):
+                seller = getattr(row, "seller_id", None)
+                item_id = str(getattr(row, "item_id"))
+                if seller in seen_sellers:
+                    continue
+                seller_seed.append(item_id)
+                seen_sellers.add(seller)
+                if len(seller_seed) >= k:
+                    break
+            population.append(self._complete_slate(seller_seed, ranked_ids, k))
+
+        pool = np.array(ranked_ids, dtype=object)
+        while len(population) < self.config.population_size and len(pool) >= k:
+            chosen = rng.choice(pool, size=k, replace=False).astype(str).tolist()
+            chosen.sort(key=lambda item_id: ranked_ids.index(item_id))
+            population.append(chosen)
+
+        return [self._complete_slate(items, ranked_ids, k) for items in population if items]
+
+    def _crossover(
+        self,
+        parent_a: List[str],
+        parent_b: List[str],
+        ranked_ids: List[str],
+        k: int,
+        rng: np.random.Generator,
+    ) -> List[str]:
+        child: List[str] = []
+        for idx in range(k):
+            source = parent_a if rng.random() < 0.5 else parent_b
+            if idx < len(source):
+                child.append(source[idx])
+        child = self._complete_slate(child, ranked_ids, k)
+        if rng.random() < self.config.mutation_rate:
+            replace_idx = int(rng.integers(0, len(child)))
+            available = [item_id for item_id in ranked_ids if item_id not in child]
+            if available:
+                child[replace_idx] = str(rng.choice(np.array(available, dtype=object)))
+                child = self._complete_slate(child, ranked_ids, k)
+        child.sort(key=lambda item_id: ranked_ids.index(item_id))
+        return child[:k]
+
+    @staticmethod
+    def _selection_key(evaluated: Mapping[str, Any]) -> Tuple[int, float, float, float]:
+        feasible_rank = 1 if evaluated.get("feasible", False) else 0
+        return (
+            feasible_rank,
+            -float(evaluated.get("hard_violation", 0.0)),
+            float(evaluated.get("fitness", 0.0)),
+            float(evaluated.get("utility", 0.0)),
+        )
+
+    def recommend(
+        self,
+        user_id: str,
+        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
+        user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]],
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        requested_k = self.config.top_k if top_k is None else int(top_k)
+        requested_k = max(0, requested_k)
+        prepared = self._prepare_candidates(candidate_items)
+        diagnostics: Dict[str, Any] = {
+            "user_id": user_id,
+            "requested_top_k": requested_k,
+            "input_candidate_count": int(len(prepared)),
+            "budget_evaluated": user_budget_info is not None,
+            "num_swaps": 0,
+        }
+
+        if requested_k == 0 or prepared.empty:
+            empty = prepared.head(0).copy()
+            diagnostics.update(
+                {
+                    "inventory_feasible_count": 0,
+                    "inventory_filtered_count": 0,
+                    "candidate_shortage": requested_k > 0,
+                    "initial_constraints": {},
+                    "final_constraints": {},
+                    "fully_repaired": False,
+                    "search_steps": 0,
+                }
+            )
+            return {"recommendations": empty, "item_ids": [], "diagnostics": diagnostics}
+
+        inventory_feasible = self.constraint_handler.check_inventory(prepared, alpha_inv=self.config.alpha_inv)
+        diagnostics["inventory_feasible_count"] = int(len(inventory_feasible))
+        diagnostics["inventory_filtered_count"] = int(len(prepared) - len(inventory_feasible))
+
+        if inventory_feasible.empty:
+            diagnostics.update(
+                {
+                    "candidate_shortage": True,
+                    "initial_constraints": {},
+                    "final_constraints": {},
+                    "fully_repaired": False,
+                    "search_steps": 0,
+                }
+            )
+            return {"recommendations": inventory_feasible.copy(), "item_ids": [], "diagnostics": diagnostics}
+
+        ranked = self._sort_by_base_score(inventory_feasible)
+        k = min(requested_k, len(ranked))
+        diagnostics["candidate_shortage"] = bool(len(ranked) < requested_k)
+        diagnostics["effective_top_k"] = int(k)
+
+        candidates_by_id = ranked.set_index("item_id", drop=False)
+        ranked_ids = ranked["item_id"].astype(str).tolist()
+        rng = np.random.default_rng(self._stable_seed(user_id, self.config.random_seed))
+        population = self._initial_population(ranked, k, rng)
+        if not population:
+            population = [ranked_ids[:k]]
+
+        initial_eval = self._evaluate_slate(population[0], candidates_by_id, user_budget_info)
+        diagnostics["initial_constraints"] = self._compact_constraint_result(initial_eval["constraints"])
+
+        best_eval = initial_eval
+        search_steps = 0
+        for _ in range(max(0, self.config.max_generations)):
+            evaluated = [
+                self._evaluate_slate(self._complete_slate(individual, ranked_ids, k), candidates_by_id, user_budget_info)
+                for individual in population
+            ]
+            evaluated.sort(key=self._selection_key, reverse=True)
+            if self._selection_key(evaluated[0]) > self._selection_key(best_eval):
+                best_eval = evaluated[0]
+
+            elites = [entry["item_ids"] for entry in evaluated[: max(1, min(self.config.elite_size, len(evaluated)))]]
+            next_population = elites.copy()
+            while len(next_population) < self.config.population_size:
+                if len(elites) >= 2:
+                    idx = rng.choice(len(elites), size=2, replace=False)
+                    parent_a, parent_b = elites[int(idx[0])], elites[int(idx[1])]
+                else:
+                    parent_a = parent_b = elites[0]
+                next_population.append(self._crossover(parent_a, parent_b, ranked_ids, k, rng))
+            population = next_population[: self.config.population_size]
+            search_steps += len(evaluated)
+
+        final = best_eval
+        final_constraints = final["constraints"]
+        diagnostics["final_constraints"] = self._compact_constraint_result(final_constraints)
+        diagnostics["fully_repaired"] = bool(final_constraints.get("all_hard_constraints_satisfied", False))
+        diagnostics["search_steps"] = int(search_steps)
+        diagnostics["final_new_item_count"] = int(final_constraints.get("new_item_count", 0))
+        diagnostics["final_seller_count"] = int(final_constraints.get("seller_count", 0))
+        diagnostics["final_budget_penalty"] = float(final_constraints.get("budget_penalty", 0.0))
+        diagnostics["final_entropy_penalty"] = float(final_constraints.get("entropy_penalty", 0.0))
+        diagnostics["final_augmented_lagrangian_penalty"] = float(
+            final_constraints.get("augmented_lagrangian_penalty", 0.0)
+        )
+        diagnostics["final_utility"] = float(final.get("utility", 0.0))
+        diagnostics["final_hard_violation"] = float(final.get("hard_violation", 0.0))
+        diagnostics["final_fitness"] = float(final.get("fitness", 0.0))
+
+        recommendations = final["slate"].copy().reset_index(drop=True)
+        return {
+            "recommendations": recommendations,
+            "item_ids": recommendations["item_id"].astype(str).tolist(),
             "diagnostics": diagnostics,
         }
