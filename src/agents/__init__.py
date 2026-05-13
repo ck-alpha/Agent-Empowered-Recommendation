@@ -15,6 +15,12 @@ from .baseline_agents import (
     InProcessingConfig,
     WeightedSumInProcessingBaseline,
 )
+from .recruiting_baseline_agents import (
+    RecruitingInProcessingAgent,
+    RecruitingInProcessingConfig,
+    RecruitingPostProcessingAgent,
+    RecruitingPostProcessingConfig,
+)
 
 __all__ = [
     'BaseAgent',
@@ -29,4 +35,8 @@ __all__ = [
     'WeightedSumInProcessingBaseline',
     'GreedyRerankConfig',
     'GreedyRerankingBaseline',
+    'RecruitingInProcessingAgent',
+    'RecruitingInProcessingConfig',
+    'RecruitingPostProcessingAgent',
+    'RecruitingPostProcessingConfig',
 ]

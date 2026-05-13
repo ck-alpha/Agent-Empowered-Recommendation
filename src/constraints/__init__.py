@@ -9,6 +9,10 @@ from .constraint_handler import (
     EcommerceConstraintConfig,
     EcommerceConstraintHandler,
 )
+from .recruiting_constraint_handler import (
+    RecruitingConstraintConfig,
+    RecruitingConstraintHandler,
+)
 
 __all__ = [
     'ConstraintConfig',
@@ -16,4 +20,6 @@ __all__ = [
     'AdaptiveConstraintHandler',
     'EcommerceConstraintConfig',
     'EcommerceConstraintHandler',
+    'RecruitingConstraintConfig',
+    'RecruitingConstraintHandler',
 ]
