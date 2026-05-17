@@ -23,9 +23,10 @@ import pandas as pd
 import seaborn as sns
 
 LOGGER = logging.getLogger(__name__)
-STRATEGY_ORDER = ["random", "pop", "bpr", "hybrid", "budget", "history", "ensemble"]
-METHOD_ORDER = ["postprocessing", "inprocessing"]
-METHOD_LABELS = {"postprocessing": "Post", "inprocessing": "In"}
+STRATEGY_ORDER = ["bpr", "item_knn", "pop"]
+STRATEGY_LABELS = {"bpr": "BPR", "item_knn": "Item-KNN", "pop": "Popularity"}
+METHOD_ORDER = ["recall_only", "postprocessing", "inprocessing"]
+METHOD_LABELS = {"recall_only": "Recall", "postprocessing": "Post", "inprocessing": "In"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +53,8 @@ def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Da
     summaries_by_strategy = payload.get("summaries_by_strategy", {})
     summaries_by_method_strategy = payload.get("summaries_by_method_strategy", {})
     records = payload.get("records", [])
+    recall_only = bool(summary.get("recall_only", False))
+    default_method = "recall_only" if recall_only else "postprocessing"
     if not summary:
         raise ValueError("Metrics JSON missing non-empty 'summary'.")
     if not records:
@@ -65,7 +68,7 @@ def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Da
                 if "::" in key:
                     method, strategy = key.split("::", 1)
                 else:
-                    method, strategy = row.get("method", "postprocessing"), key
+                    method, strategy = row.get("method", default_method), key
                 row.setdefault("method", method)
                 row.setdefault("strategy", strategy)
             rows.append(row)
@@ -75,31 +78,33 @@ def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Da
         for strategy, strategy_summary in summaries_by_strategy.items():
             row = dict(strategy_summary)
             row["strategy"] = strategy
-            row.setdefault("method", row.get("method", "postprocessing"))
+            row.setdefault("method", row.get("method", default_method))
             rows.append(row)
         summary_df = pd.DataFrame(rows)
     else:
         row = dict(summary)
         row["strategy"] = row.get("recall_strategy", "strategy")
-        row.setdefault("method", row.get("method", "postprocessing"))
+        row.setdefault("method", row.get("method", default_method))
         summary_df = pd.DataFrame([row])
 
     records_df = pd.DataFrame(records)
     if "strategy" not in records_df.columns:
         records_df["strategy"] = summary.get("recall_strategy", "strategy")
     if "method" not in records_df.columns:
-        records_df["method"] = summary.get("method", "postprocessing")
+        records_df["method"] = summary.get("method", default_method)
     if "search_steps" not in records_df.columns:
         records_df["search_steps"] = 0
 
-    summary_df["method"] = summary_df["method"].fillna("postprocessing").astype(str)
-    records_df["method"] = records_df["method"].fillna("postprocessing").astype(str)
+    summary_df["method"] = summary_df["method"].fillna(default_method).astype(str)
+    records_df["method"] = records_df["method"].fillna(default_method).astype(str)
     summary_df["strategy"] = pd.Categorical(summary_df["strategy"], categories=STRATEGY_ORDER, ordered=True)
     summary_df["method"] = pd.Categorical(summary_df["method"], categories=METHOD_ORDER, ordered=True)
     summary_df = summary_df.sort_values("strategy").reset_index(drop=True)
     records_df["strategy"] = pd.Categorical(records_df["strategy"], categories=STRATEGY_ORDER, ordered=True)
     records_df["method"] = pd.Categorical(records_df["method"], categories=METHOD_ORDER, ordered=True)
     summary_df = summary_df.sort_values(["strategy", "method"]).reset_index(drop=True)
+    summary_df["strategy"] = summary_df["strategy"].astype(str).map(lambda value: STRATEGY_LABELS.get(value, value))
+    records_df["strategy"] = records_df["strategy"].astype(str).map(lambda value: STRATEGY_LABELS.get(value, value))
     summary_df["method_strategy"] = summary_df.apply(_method_strategy_label, axis=1)
     records_df["method_strategy"] = records_df.apply(_method_strategy_label, axis=1)
     return summary, summary_df, records_df
@@ -108,7 +113,7 @@ def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Da
 def _method_strategy_label(row: pd.Series) -> str:
     method = str(row.get("method", "postprocessing"))
     strategy = str(row.get("strategy", "strategy"))
-    if method in METHOD_LABELS:
+    if method in METHOD_LABELS and method != "recall_only":
         return f"{METHOD_LABELS[method]}-{strategy}"
     return strategy
 
@@ -154,7 +159,12 @@ def _to_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
 
 
 def plot_recall_accuracy_comparison(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
-    required = ["recall_hit_at_k", "raw_top10_hit_at_10", "final_hit_at_10", "final_ndcg_at_10"]
+    recall_only = "recall_ndcg_at_k" in summary_df.columns and "final_hit_at_10" not in summary_df.columns
+    required = (
+        ["recall_hit_at_k", "recall_ndcg_at_k", "recall_mrr_at_k"]
+        if recall_only
+        else ["recall_hit_at_k", "raw_top10_hit_at_10", "final_hit_at_10", "final_ndcg_at_10"]
+    )
     missing = [col for col in required if col not in summary_df.columns]
     if missing:
         raise ValueError(f"Summary missing keys required for accuracy plot: {missing}")
@@ -168,6 +178,8 @@ def plot_recall_accuracy_comparison(summary_df: pd.DataFrame, output_dir: Path, 
     )
     names = {
         "recall_hit_at_k": "Recall HR@K",
+        "recall_ndcg_at_k": "Recall NDCG@K",
+        "recall_mrr_at_k": "Recall MRR@K",
         "raw_top10_hit_at_10": "Raw HR@10",
         "final_hit_at_10": "Agent HR@10",
         "final_ndcg_at_10": "Agent NDCG@10",
@@ -176,7 +188,7 @@ def plot_recall_accuracy_comparison(summary_df: pd.DataFrame, output_dir: Path, 
 
     fig, ax = plt.subplots(figsize=(max(8.0, 0.72 * summary_df[x_col].nunique()), 4.2))
     sns.barplot(data=plot_df, x=x_col, y="Score", hue="Metric", ax=ax)
-    ax.set_title("Recall Strategy Accuracy Comparison")
+    ax.set_title("Recall Strategy Accuracy Comparison" if not recall_only else "Recall-Only Strategy Comparison")
     ax.set_xlabel("Method / recall strategy" if x_col == "method_strategy" else "Recall strategy")
     ax.set_ylabel("Rate / NDCG")
     ax.set_ylim(0, max(0.05, float(plot_df["Score"].max()) * 1.25 if plot_df["Score"].notna().any() else 0.05))
@@ -439,6 +451,13 @@ def main() -> None:
     output_dir = Path(args.output_dir)
 
     plot_recall_accuracy_comparison(summary_df, output_dir, args.format, args.dpi)
+    recall_only = bool(summary.get("recall_only", False)) or (
+        "recall_ndcg_at_k" in summary_df.columns and "final_hit_at_10" not in summary_df.columns
+    )
+    if recall_only:
+        LOGGER.info("Detected recall-only metrics; skipping processing/constraint plots.")
+        return
+
     plot_constraint_by_strategy(summary_df, output_dir, args.format, args.dpi)
     plot_constraint_improvement(summary, output_dir, args.format, args.dpi)
     plot_recall_funnel(summary_df, output_dir, args.format, args.dpi)

@@ -1,20 +1,19 @@
 """
-Scenario-1 offline runner: multi-strategy recall -> constrained e-commerce post-processing.
+Scenario-1 offline runner: recall-only diagnostics or recall -> constrained e-commerce processing.
 
-Recommended smoke command:
+Recommended recall-only smoke command:
 /home/username/conda/envs/dualagent/bin/python src/run_scenario1_baselines.py \
-  --recall_strategy all --test_users 50 --recall_k 100 --iterations 5 --factors 32 \
+  --recall_only --recall_strategy all --test_users 50 --recall_k 100 --iterations 5 --factors 16 \
   --output_json results/scenario1_metrics_recall_suite_smoke.json
 
-Recommended full command:
+Recommended recall-only full command:
 /home/username/conda/envs/dualagent/bin/python src/run_scenario1_baselines.py \
-  --recall_strategy all --test_users 100000 --recall_k 200 --top_k 10 \
-  --factors 128 --iterations 100 \
+  --recall_only --recall_strategy all --test_users 100000 --recall_k 200 \
   --output_json results/scenario1_metrics_recall_suite_full.json
 
 This script evaluates a rigorous recommendation funnel:
 1) temporal train/test split with each user's last interaction as ground truth;
-2) multiple recall strategies: random, popularity, BPR, hybrid, budget, history, ensemble;
+2) recall strategies: BPR, Item-KNN, popularity;
 3) inverse mapping from implicit internal item ids back to original item_id;
 4) feature join with scenario-1 synthesized item table;
 5) EcommercePostProcessingAgent constrained reranking;
@@ -44,6 +43,13 @@ try:
 except ImportError:  # pragma: no cover - exercised only when optional dependency is absent.
     BayesianPersonalizedRanking = None
 
+try:
+    from implicit.nearest_neighbours import BM25Recommender, CosineRecommender, TFIDFRecommender
+except ImportError:  # pragma: no cover - exercised only when optional dependency is absent.
+    BM25Recommender = None
+    CosineRecommender = None
+    TFIDFRecommender = None
+
 # Allow running as: python src/run_scenario1_baselines.py
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -57,8 +63,9 @@ from agents import (
 LOGGER = logging.getLogger(__name__)
 RANDOM_SEED = 42
 EPS = 1e-9
-SINGLE_STRATEGIES = ["random", "pop", "bpr", "hybrid", "budget", "history", "ensemble"]
-BPR_STRATEGIES = {"bpr", "hybrid", "ensemble"}
+SINGLE_STRATEGIES = ["bpr", "item_knn", "pop"]
+BPR_STRATEGIES = {"bpr"}
+ITEM_KNN_STRATEGIES = {"item_knn"}
 REQUIRED_ITEM_COLUMNS = [
     "item_id",
     "stockout_risk",
@@ -131,9 +138,26 @@ class EvalRecord:
     final_ndcg_at_10: float
 
 
+@dataclass
+class RecallEvalRecord:
+    """Per-user recall-only evaluation record."""
+
+    strategy: str
+    user_id: str
+    ground_truth_item_id: str
+    history_length: int
+    history_bucket: str
+    ground_truth_in_train_items: bool
+    recall_count: int
+    recall_hit_at_k: float
+    recall_ndcg_at_k: float
+    recall_mrr_at_k: float
+    ground_truth_rank: Optional[int]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run scenario-1 multi-strategy recall plus constrained post-processing baseline."
+        description="Run scenario-1 recall diagnostics or constrained processing baselines."
     )
     parser.add_argument("--processed_dir", default="data/processed", help="Directory containing scenario-1 parquet files.")
     parser.add_argument("--output_prefix", default="beauty_scenario1", help="Scenario-1 parquet filename prefix.")
@@ -145,8 +169,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_users", type=int, default=1000, help="Maximum number of eligible users to evaluate.")
     parser.add_argument("--recall_k", type=int, default=200, help="Recall size before reranking.")
     parser.add_argument("--top_k", type=int, default=10, help="Final recommendation list length.")
-    parser.add_argument("--factors", type=int, default=128, help="BPR latent factor dimension.")
-    parser.add_argument("--iterations", type=int, default=100, help="BPR training iterations.")
+    parser.add_argument("--factors", type=int, default=64, help="BPR latent factor dimension.")
+    parser.add_argument("--iterations", type=int, default=300, help="BPR training iterations.")
+    parser.add_argument("--bpr_learning_rate", type=float, default=0.05, help="BPR SGD learning rate.")
+    parser.add_argument("--bpr_regularization", type=float, default=0.1, help="BPR regularization strength.")
+    parser.add_argument("--item_knn_neighbors", type=int, default=100, help="Item-KNN neighbor count.")
+    parser.add_argument(
+        "--item_knn_weighting",
+        choices=["bm25", "cosine", "tfidf"],
+        default="bm25",
+        help="Item-KNN sparse weighting/similarity model.",
+    )
     parser.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed for sampling, BPR, and random recall.")
     parser.add_argument("--min_user_interactions", type=int, default=3, help="Minimum interactions before temporal split.")
     parser.add_argument(
@@ -158,16 +191,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--recall_strategy",
         choices=SINGLE_STRATEGIES + ["all"],
-        default="hybrid",
-        help="Recall strategy. Use 'all' to run the full comparison suite.",
+        default="all",
+        help="Recall strategy. Use 'all' to run BPR, Item-KNN, and popularity.",
     )
-    parser.add_argument("--hybrid_bpr_weight", type=float, default=0.5, help="BPR weight in hybrid score fusion.")
+    parser.add_argument("--hybrid_bpr_weight", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument(
         "--baseline_mode",
         choices=["postprocessing", "inprocessing", "both"],
         default="both",
         help="Constrained baseline layer to evaluate.",
     )
+    parser.add_argument("--recall_only", action="store_true", help="Only evaluate recall metrics; skip processing agents.")
     parser.add_argument("--show_progress", action="store_true", help="Show implicit BPR training progress.")
     return parser.parse_args()
 
@@ -180,11 +214,18 @@ def resolve_methods(baseline_mode: str) -> List[str]:
     return ["postprocessing", "inprocessing"] if baseline_mode == "both" else [baseline_mode]
 
 
-def ensure_implicit_available(required: bool = True) -> None:
+def ensure_implicit_available(required: bool = True, *, require_bpr: bool = False, require_item_knn: bool = False) -> None:
     """Fail fast with an actionable message when implicit is required but not installed."""
-    if required and BayesianPersonalizedRanking is None:
+    if not required:
+        return
+    missing = []
+    if require_bpr and BayesianPersonalizedRanking is None:
+        missing.append("implicit.bpr")
+    if require_item_knn and BM25Recommender is None:
+        missing.append("implicit.nearest_neighbours")
+    if missing:
         raise RuntimeError(
-            "Missing optional dependency 'implicit'. Install project dependencies with:\n"
+            f"Missing optional dependency modules: {missing}. Install project dependencies with:\n"
             "  pip install -r requirements.txt\n"
             "or install it directly with:\n"
             "  pip install 'implicit>=0.7.0'"
@@ -294,24 +335,105 @@ def build_user_item_matrix(train_interactions: pd.DataFrame, mappings: IdMapping
     return matrix
 
 
-def train_bpr_model(user_item_matrix: csr_matrix, factors: int, iterations: int, seed: int, show_progress: bool):
+def train_bpr_model(
+    user_item_matrix: csr_matrix,
+    factors: int,
+    iterations: int,
+    learning_rate: float,
+    regularization: float,
+    seed: int,
+    show_progress: bool,
+) -> Tuple[Any, Dict[str, Any]]:
     """Train implicit BPR recall model."""
-    ensure_implicit_available(required=True)
+    ensure_implicit_available(required=True, require_bpr=True)
     model = BayesianPersonalizedRanking(
         factors=factors,
         iterations=iterations,
+        learning_rate=learning_rate,
+        regularization=regularization,
         random_state=seed,
     )
     LOGGER.info(
-        "Training BPR: users=%s, items=%s, nnz=%s, factors=%s, iterations=%s",
+        "Training BPR: users=%s, items=%s, nnz=%s, factors=%s, iterations=%s, learning_rate=%.4f, regularization=%.4f",
         user_item_matrix.shape[0],
         user_item_matrix.shape[1],
         user_item_matrix.nnz,
         factors,
         iterations,
+        learning_rate,
+        regularization,
     )
+    diagnostics: Dict[str, Any] = {
+        "model": "bpr",
+        "users": int(user_item_matrix.shape[0]),
+        "items": int(user_item_matrix.shape[1]),
+        "nnz": int(user_item_matrix.nnz),
+        "factors": int(factors),
+        "iterations": int(iterations),
+        "learning_rate": float(learning_rate),
+        "regularization": float(regularization),
+    }
+
+    def callback(epoch: int, elapsed: float, correct: int, skipped: int) -> None:
+        usable = max(0, int(user_item_matrix.nnz) - int(skipped))
+        train_auc = float(correct / usable) if usable > 0 else None
+        row = {
+            "epoch": int(epoch),
+            "elapsed_seconds": float(elapsed),
+            "train_auc": train_auc,
+            "skipped_ratio": float(skipped / max(1, int(user_item_matrix.nnz))),
+            "correct_pairs": int(correct),
+            "skipped_pairs": int(skipped),
+        }
+        if epoch == 0:
+            diagnostics["first_epoch"] = row
+        diagnostics["last_epoch"] = row
+
+    start = time.time()
+    model.fit(user_item_matrix, show_progress=show_progress, callback=callback)
+    diagnostics["fit_seconds"] = float(time.time() - start)
+    return model, diagnostics
+
+
+def train_item_knn_model(
+    user_item_matrix: csr_matrix,
+    neighbors: int,
+    weighting: str,
+    show_progress: bool,
+) -> Tuple[Any, Dict[str, Any]]:
+    """Train an implicit Item-KNN recall model."""
+    ensure_implicit_available(required=True, require_item_knn=True)
+    neighbors = max(1, int(neighbors))
+    weighting = str(weighting).lower()
+    if weighting == "bm25":
+        model = BM25Recommender(K=neighbors)
+    elif weighting == "cosine":
+        model = CosineRecommender(K=neighbors)
+    elif weighting == "tfidf":
+        model = TFIDFRecommender(K=neighbors)
+    else:
+        raise ValueError(f"Unsupported item_knn_weighting: {weighting}")
+
+    LOGGER.info(
+        "Training Item-KNN: users=%s, items=%s, nnz=%s, neighbors=%s, weighting=%s",
+        user_item_matrix.shape[0],
+        user_item_matrix.shape[1],
+        user_item_matrix.nnz,
+        neighbors,
+        weighting,
+    )
+    start = time.time()
     model.fit(user_item_matrix, show_progress=show_progress)
-    return model
+    diagnostics = {
+        "model": "item_knn",
+        "users": int(user_item_matrix.shape[0]),
+        "items": int(user_item_matrix.shape[1]),
+        "nnz": int(user_item_matrix.nnz),
+        "neighbors": int(neighbors),
+        "weighting": weighting,
+        "fit_seconds": float(time.time() - start),
+    }
+    return model, diagnostics
 
 
 def build_popularity_scores(train_interactions: pd.DataFrame) -> pd.Series:
@@ -348,19 +470,31 @@ def _stable_user_seed(user_id: str, seed: int, namespace: str) -> int:
 
 
 def _empty_recall() -> pd.DataFrame:
-    return pd.DataFrame(columns=["item_id", "base_score", "bpr_score", "pop_score", "budget_score", "history_score", "random_score"])
+    return pd.DataFrame(
+        columns=[
+            "item_id",
+            "base_score",
+            "bpr_score",
+            "item_knn_score",
+            "pop_score",
+            "budget_score",
+            "history_score",
+            "random_score",
+        ]
+    )
 
 
 def _finalize_recall(df: pd.DataFrame, recall_k: int) -> pd.DataFrame:
     if df.empty:
         return _empty_recall()
     df = df.copy()
-    for col in ["bpr_score", "pop_score", "budget_score", "history_score", "random_score"]:
+    score_columns = ["bpr_score", "item_knn_score", "pop_score", "budget_score", "history_score", "random_score"]
+    for col in score_columns:
         if col not in df.columns:
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     if "base_score" not in df.columns:
-        score_cols = [col for col in ["bpr_score", "pop_score", "budget_score", "history_score", "random_score"] if df[col].abs().sum() > 0]
+        score_cols = [col for col in score_columns if df[col].abs().sum() > 0]
         if score_cols:
             df["base_score"] = sum(_minmax(df[col]) for col in score_cols) / len(score_cols)
         else:
@@ -372,10 +506,9 @@ def _finalize_recall(df: pd.DataFrame, recall_k: int) -> pd.DataFrame:
 def build_item_catalog(items: pd.DataFrame, popularity_scores: pd.Series) -> pd.DataFrame:
     """Build an item feature view used by content-aware recall strategies."""
     catalog = items[["item_id", "price_filled", "brand_id", "seller_id"]].copy()
-    if "popularity" in items.columns:
-        catalog["item_popularity"] = pd.to_numeric(items["popularity"], errors="coerce").fillna(0.0)
-    else:
-        catalog["item_popularity"] = catalog["item_id"].map(popularity_scores).fillna(0.0)
+    # Recall-layer popularity must come only from the temporal train split. The
+    # item table's precomputed popularity is built from full interactions and can leak test-period signal.
+    catalog["item_popularity"] = catalog["item_id"].map(popularity_scores).fillna(0.0)
     catalog["price_filled"] = pd.to_numeric(catalog["price_filled"], errors="coerce")
     catalog["item_popularity_norm"] = _minmax(catalog["item_popularity"])
     return catalog.sort_values(["item_popularity_norm", "item_id"], ascending=[False, True]).reset_index(drop=True)
@@ -430,6 +563,14 @@ def build_train_history_by_user(train_df: pd.DataFrame, target_users: Optional[s
     return source.groupby("user_id")["item_id"].agg(lambda values: set(map(str, values))).to_dict()
 
 
+def build_train_history_lengths(train_df: pd.DataFrame, target_users: Optional[set] = None) -> Dict[str, int]:
+    """Build user -> temporal-train interaction count for recall diagnostics."""
+    source = train_df
+    if target_users is not None:
+        source = train_df[train_df["user_id"].isin(target_users)]
+    return source.groupby("user_id").size().astype(int).to_dict()
+
+
 def build_user_history_profiles(
     train_df: pd.DataFrame,
     items: pd.DataFrame,
@@ -454,7 +595,7 @@ def _normalize_recommend_result(item_indices: Any, scores: Any) -> Tuple[np.ndar
     item_indices = np.asarray(item_indices).reshape(-1)
     scores = np.asarray(scores).reshape(-1)
     if len(item_indices) != len(scores):
-        raise ValueError("BPR recommend returned item ids and scores with different lengths.")
+        raise ValueError("Recommend returned item ids and scores with different lengths.")
     return item_indices, scores
 
 
@@ -490,6 +631,39 @@ def recall_bpr_candidates(
         valid_scores.append(float(score))
 
     return pd.DataFrame({"item_id": original_item_ids, "bpr_score": valid_scores})
+
+
+def recall_item_knn_candidates(
+    model: Any,
+    user_id: str,
+    mappings: IdMappings,
+    user_item_matrix: csr_matrix,
+    recall_k: int,
+) -> pd.DataFrame:
+    """Recall Item-KNN candidates and inverse-map internal item ids to original item_id."""
+    user_idx = mappings.user_id_to_idx.get(user_id)
+    if user_idx is None or model is None:
+        return pd.DataFrame(columns=["item_id", "item_knn_score"])
+
+    internal_item_indices, scores = model.recommend(
+        user_idx,
+        user_item_matrix[user_idx],
+        N=recall_k,
+        filter_already_liked_items=True,
+    )
+    internal_item_indices, scores = _normalize_recommend_result(internal_item_indices, scores)
+
+    original_item_ids: List[str] = []
+    valid_scores: List[float] = []
+    for internal_idx, score in zip(internal_item_indices, scores):
+        item_id = mappings.idx_to_item_id.get(int(internal_idx))
+        if item_id is None:
+            LOGGER.warning("Skip unmapped internal item id from Item-KNN: %s", internal_idx)
+            continue
+        original_item_ids.append(item_id)
+        valid_scores.append(float(score))
+
+    return pd.DataFrame({"item_id": original_item_ids, "item_knn_score": valid_scores})
 
 
 def recall_pop_candidates(
@@ -821,22 +995,9 @@ def recall_candidates(
     recall_cache: Optional[RecallCache] = None,
 ) -> pd.DataFrame:
     """Recall candidates using one of the supported strategies."""
-    hybrid_bpr_weight = min(1.0, max(0.0, float(hybrid_bpr_weight)))
-    pop_weight = 1.0 - hybrid_bpr_weight
     use_fast = recall_backend == "fast"
     if use_fast and recall_cache is None:
         raise ValueError("Fast recall backend requires a RecallCache.")
-
-    if strategy == "random":
-        random_df = (
-            recall_random_candidates_fast(user_id, train_by_user, recall_cache, recall_k, seed)
-            if use_fast
-            else recall_random_candidates(user_id, train_by_user, item_catalog, recall_k, seed)
-        )
-        if random_df.empty:
-            return _empty_recall()
-        random_df["base_score"] = _rank_fallback_score(random_df, "random_score")
-        return _finalize_recall(random_df, recall_k)
 
     if strategy == "bpr":
         bpr_df = recall_bpr_candidates(model, user_id, mappings, user_item_matrix, recall_k)
@@ -844,6 +1005,13 @@ def recall_candidates(
             return _empty_recall()
         bpr_df["base_score"] = _rank_fallback_score(bpr_df, "bpr_score")
         return _finalize_recall(bpr_df, recall_k)
+
+    if strategy == "item_knn":
+        item_knn_df = recall_item_knn_candidates(model, user_id, mappings, user_item_matrix, recall_k)
+        if item_knn_df.empty:
+            return _empty_recall()
+        item_knn_df["base_score"] = _rank_fallback_score(item_knn_df, "item_knn_score")
+        return _finalize_recall(item_knn_df, recall_k)
 
     if strategy == "pop":
         pop_df = (
@@ -855,60 +1023,6 @@ def recall_candidates(
             return _empty_recall()
         pop_df["base_score"] = _rank_fallback_score(pop_df, "pop_score")
         return _finalize_recall(pop_df, recall_k)
-
-    if strategy == "budget":
-        budget_df = (
-            recall_budget_candidates_fast(user_id, train_by_user, recall_cache, user_budget_info, recall_k)
-            if use_fast
-            else recall_budget_candidates(user_id, train_by_user, item_catalog, user_budget_info, recall_k)
-        )
-        if budget_df.empty:
-            return _empty_recall()
-        budget_df["base_score"] = _rank_fallback_score(budget_df, "budget_score")
-        return _finalize_recall(budget_df, recall_k)
-
-    if strategy == "history":
-        history_df = (
-            recall_history_candidates_fast(user_id, train_by_user, recall_cache, user_profiles, recall_k)
-            if use_fast
-            else recall_history_candidates(user_id, train_by_user, item_catalog, user_profiles, popularity_scores, recall_k)
-        )
-        if history_df.empty:
-            return _empty_recall()
-        history_df["base_score"] = _rank_fallback_score(history_df, "history_score")
-        return _finalize_recall(history_df, recall_k)
-
-    if strategy == "hybrid":
-        bpr_df = recall_bpr_candidates(model, user_id, mappings, user_item_matrix, recall_k)
-        pop_df = (
-            recall_pop_candidates_fast(user_id, train_by_user, recall_cache, recall_k)
-            if use_fast
-            else recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
-        )
-        return _merge_recall_sources(
-            [(bpr_df, "bpr_score", hybrid_bpr_weight), (pop_df, "pop_score", pop_weight)],
-            recall_k,
-        )
-
-    if strategy == "ensemble":
-        bpr_df = recall_bpr_candidates(model, user_id, mappings, user_item_matrix, recall_k)
-        if use_fast:
-            pop_df = recall_pop_candidates_fast(user_id, train_by_user, recall_cache, recall_k)
-            budget_df = recall_budget_candidates_fast(user_id, train_by_user, recall_cache, user_budget_info, recall_k)
-            history_df = recall_history_candidates_fast(user_id, train_by_user, recall_cache, user_profiles, recall_k)
-        else:
-            pop_df = recall_pop_candidates(user_id, train_by_user, popularity_scores, recall_k)
-            budget_df = recall_budget_candidates(user_id, train_by_user, item_catalog, user_budget_info, recall_k)
-            history_df = recall_history_candidates(user_id, train_by_user, item_catalog, user_profiles, popularity_scores, recall_k)
-        return _merge_recall_sources(
-            [
-                (bpr_df, "bpr_score", 0.35),
-                (pop_df, "pop_score", 0.25),
-                (budget_df, "budget_score", 0.20),
-                (history_df, "history_score", 0.20),
-            ],
-            recall_k,
-        )
 
     raise ValueError(f"Unsupported recall strategy: {strategy}")
 
@@ -953,6 +1067,31 @@ def compute_hr_ndcg_at_k(recommended_items: List[str], ground_truth_item_id: str
     except ValueError:
         return 0.0, 0.0
     return 1.0, float(1.0 / np.log2(rank_idx + 2))
+
+
+def compute_recall_metrics_at_k(
+    recommended_items: List[str],
+    ground_truth_item_id: str,
+    k: int,
+) -> Tuple[float, float, float, Optional[int]]:
+    """Single-ground-truth HR/NDCG/MRR@K plus one-indexed hit rank."""
+    top_items = recommended_items[:k]
+    try:
+        rank_idx = top_items.index(ground_truth_item_id)
+    except ValueError:
+        return 0.0, 0.0, 0.0, None
+    rank = rank_idx + 1
+    return 1.0, float(1.0 / np.log2(rank_idx + 2)), float(1.0 / rank), rank
+
+
+def history_bucket(history_length: int) -> str:
+    if history_length <= 2:
+        return "hist=2"
+    if history_length == 3:
+        return "hist=3"
+    if history_length <= 5:
+        return "hist=4-5"
+    return "hist>=6"
 
 
 def sample_test_users(test_df: pd.DataFrame, mappings: IdMappings, test_users: int, seed: int) -> pd.DataFrame:
@@ -1122,6 +1261,70 @@ def run_reranking_evaluation(
     return records
 
 
+def run_recall_only_evaluation(
+    strategy: str,
+    model: Any,
+    sampled_test: pd.DataFrame,
+    mappings: IdMappings,
+    user_item_matrix: csr_matrix,
+    train_by_user: Mapping[str, set],
+    train_history_lengths: Mapping[str, int],
+    popularity_scores: pd.Series,
+    recall_k: int,
+) -> List[RecallEvalRecord]:
+    """Run recall-only diagnostics without joining item features or invoking processing agents."""
+    records: List[RecallEvalRecord] = []
+    skipped_no_recall = 0
+
+    desc = f"Evaluating recall [{strategy}]"
+    for row in tqdm(sampled_test.itertuples(index=False), total=len(sampled_test), desc=desc):
+        user_id = str(row.user_id)
+        ground_truth = str(row.item_id)
+        recall_df = recall_candidates(
+            strategy=strategy,
+            model=model,
+            user_id=user_id,
+            mappings=mappings,
+            user_item_matrix=user_item_matrix,
+            train_by_user=train_by_user,
+            popularity_scores=popularity_scores,
+            item_catalog=pd.DataFrame(),
+            user_profiles={},
+            user_budget_info=pd.Series(dtype=float),
+            recall_k=recall_k,
+            hybrid_bpr_weight=0.0,
+            seed=RANDOM_SEED,
+            recall_backend="legacy",
+            recall_cache=None,
+        )
+        if recall_df.empty:
+            skipped_no_recall += 1
+            continue
+
+        recalled_items = recall_df["item_id"].astype(str).tolist()
+        hr, ndcg, mrr, rank = compute_recall_metrics_at_k(recalled_items, ground_truth, recall_k)
+        hist_len = int(train_history_lengths.get(user_id, len(train_by_user.get(user_id, set()))))
+        records.append(
+            RecallEvalRecord(
+                strategy=strategy,
+                user_id=user_id,
+                ground_truth_item_id=ground_truth,
+                history_length=hist_len,
+                history_bucket=history_bucket(hist_len),
+                ground_truth_in_train_items=ground_truth in mappings.item_id_to_idx,
+                recall_count=int(len(recall_df)),
+                recall_hit_at_k=float(hr),
+                recall_ndcg_at_k=float(ndcg),
+                recall_mrr_at_k=float(mrr),
+                ground_truth_rank=rank,
+            )
+        )
+
+    if skipped_no_recall:
+        LOGGER.warning("[%s] Skipped %s users because recall returned no candidates.", strategy, skipped_no_recall)
+    return records
+
+
 def _mean_dict(records: List[EvalRecord]) -> Dict[str, float]:
     if not records:
         return {}
@@ -1148,6 +1351,72 @@ def _mean_dict(records: List[EvalRecord]) -> Dict[str, float]:
     return {key: float(np.mean([getattr(record, key) for record in records])) for key in keys}
 
 
+def _mean_recall_dict(records: List[RecallEvalRecord]) -> Dict[str, float]:
+    if not records:
+        return {}
+    keys = ["recall_count", "recall_hit_at_k", "recall_ndcg_at_k", "recall_mrr_at_k"]
+    return {key: float(np.mean([getattr(record, key) for record in records])) for key in keys}
+
+
+def make_recall_only_summary(records: List[RecallEvalRecord], strategy: str, recall_k: int) -> Dict[str, Any]:
+    summary = _mean_recall_dict(records)
+    bucket_metrics: Dict[str, Dict[str, float]] = {}
+    for bucket in ["hist=2", "hist=3", "hist=4-5", "hist>=6"]:
+        bucket_records = [record for record in records if record.history_bucket == bucket]
+        bucket_metrics[bucket] = {
+            "num_users": int(len(bucket_records)),
+            "recall_hit_at_k": float(np.mean([record.recall_hit_at_k for record in bucket_records]))
+            if bucket_records
+            else 0.0,
+        }
+
+    cold_start_rate = (
+        float(np.mean([not record.ground_truth_in_train_items for record in records])) if records else 0.0
+    )
+    summary.update(
+        {
+            "num_users": len(records),
+            "recall_strategy": strategy,
+            "method": "recall_only",
+            "recall_only": True,
+            "recall_k": recall_k,
+            "history_bucket_metrics": bucket_metrics,
+            "cold_start_unrecallable_rate": cold_start_rate,
+            "train_item_coverage_rate": 1.0 - cold_start_rate,
+        }
+    )
+    return summary
+
+
+def make_recall_suite_summary(
+    summaries_by_strategy: Mapping[str, Dict[str, Any]],
+    recall_k: int,
+) -> Dict[str, Any]:
+    """Build a compact macro summary for multi-strategy recall-only suites."""
+    rows = list(summaries_by_strategy.values())
+    metrics = ["recall_count", "recall_hit_at_k", "recall_ndcg_at_k", "recall_mrr_at_k"]
+    summary = {
+        metric: float(np.mean([float(row.get(metric, 0.0)) for row in rows])) if rows else 0.0
+        for metric in metrics
+    }
+    cold_start_rate = (
+        float(np.mean([float(row.get("cold_start_unrecallable_rate", 0.0)) for row in rows])) if rows else 0.0
+    )
+    summary.update(
+        {
+            "num_users": int(max((int(row.get("num_users", 0)) for row in rows), default=0)),
+            "num_strategy_user_records": int(sum(int(row.get("num_users", 0)) for row in rows)),
+            "recall_strategy": "all",
+            "method": "recall_only",
+            "recall_only": True,
+            "recall_k": recall_k,
+            "cold_start_unrecallable_rate": cold_start_rate,
+            "train_item_coverage_rate": 1.0 - cold_start_rate,
+        }
+    )
+    return summary
+
+
 def make_summary(
     records: List[EvalRecord],
     strategy: str,
@@ -1170,6 +1439,34 @@ def make_summary(
         }
     )
     return summary
+
+
+def log_recall_only_report(summary: Dict[str, Any], recall_k: int) -> None:
+    """Log aggregate recall-only diagnostics."""
+    if not summary:
+        LOGGER.warning("No recall-only evaluation records produced; final report is empty.")
+        return
+
+    LOGGER.info("\n%s", "=" * 78)
+    LOGGER.info("Scenario-1 Recall-Only Report")
+    LOGGER.info("%s", "=" * 78)
+    LOGGER.info("Evaluated users                    : %d", int(summary.get("num_users", 0)))
+    LOGGER.info("Recall strategy                    : %s", summary.get("recall_strategy"))
+    LOGGER.info("Recall K                           : %d", recall_k)
+    LOGGER.info("Mean recall count                  : %.4f", summary.get("recall_count", 0.0))
+    LOGGER.info("Hit Rate@%d (Recall)               : %.4f", recall_k, summary.get("recall_hit_at_k", 0.0))
+    LOGGER.info("NDCG@%d (Recall)                   : %.4f", recall_k, summary.get("recall_ndcg_at_k", 0.0))
+    LOGGER.info("MRR@%d (Recall)                    : %.4f", recall_k, summary.get("recall_mrr_at_k", 0.0))
+    LOGGER.info("Cold-start unrecallable rate       : %.4f", summary.get("cold_start_unrecallable_rate", 0.0))
+    for bucket, bucket_summary in summary.get("history_bucket_metrics", {}).items():
+        LOGGER.info(
+            "%s users / HR@%d                 : %d / %.4f",
+            bucket,
+            recall_k,
+            int(bucket_summary.get("num_users", 0)),
+            float(bucket_summary.get("recall_hit_at_k", 0.0)),
+        )
+    LOGGER.info("%s\n", "=" * 78)
 
 
 def log_final_report(summary: Dict[str, Any], recall_k: int, top_k: int) -> None:
@@ -1209,11 +1506,12 @@ def log_final_report(summary: Dict[str, Any], recall_k: int, top_k: int) -> None
 def save_metrics_json(
     output_json: str,
     args: argparse.Namespace,
-    records: List[EvalRecord],
+    records: Sequence[Any],
     summary: Dict[str, Any],
     summaries_by_strategy: Dict[str, Dict[str, Any]],
     summaries_by_method_strategy: Optional[Dict[str, Dict[str, Any]]] = None,
     completed_strategies: Optional[Sequence[str]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Persist per-user records and aggregate summary for plotting."""
     output_path = Path(output_json)
@@ -1224,6 +1522,7 @@ def save_metrics_json(
         "summaries_by_strategy": summaries_by_strategy,
         "summaries_by_method_strategy": summaries_by_method_strategy or {},
         "completed_strategies": list(completed_strategies or summaries_by_strategy.keys()),
+        "diagnostics": diagnostics or {},
         "records": [asdict(record) for record in records],
     }
     with output_path.open("w", encoding="utf-8") as f:
@@ -1236,11 +1535,17 @@ def main() -> None:
     args = parse_args()
     np.random.seed(args.seed)
     strategies = resolve_strategies(args.recall_strategy)
-    methods = resolve_methods(args.baseline_mode)
+    methods = [] if args.recall_only else resolve_methods(args.baseline_mode)
 
     if any(strategy in BPR_STRATEGIES for strategy in strategies):
         try:
-            ensure_implicit_available(required=True)
+            ensure_implicit_available(required=True, require_bpr=True)
+        except RuntimeError as exc:
+            LOGGER.error("%s", exc)
+            sys.exit(1)
+    if any(strategy in ITEM_KNN_STRATEGIES for strategy in strategies):
+        try:
+            ensure_implicit_available(required=True, require_item_knn=True)
         except RuntimeError as exc:
             LOGGER.error("%s", exc)
             sys.exit(1)
@@ -1253,25 +1558,120 @@ def main() -> None:
     sampled_user_ids = set(sampled_test["user_id"].astype(str))
     popularity_scores = build_popularity_scores(train_df)
     train_by_user = build_train_history_by_user(train_df, sampled_user_ids)
-    if args.recall_backend == "fast":
+    train_history_lengths = build_train_history_lengths(train_df, sampled_user_ids)
+    if args.recall_only:
+        LOGGER.info("Recall-only mode: skipping item feature cache and processing agents.")
+        recall_cache = None
+        item_catalog = pd.DataFrame()
+        user_profiles = {}
+    elif args.recall_backend == "fast":
         LOGGER.info("Building fast recall cache.")
         recall_cache = build_recall_cache(items, popularity_scores)
         item_catalog = pd.DataFrame()
+        user_profiles = build_user_history_profiles(train_df, items, sampled_user_ids)
     else:
         LOGGER.info("Using legacy recall backend.")
         recall_cache = None
         item_catalog = build_item_catalog(items, popularity_scores)
-    user_profiles = build_user_history_profiles(train_df, items, sampled_user_ids)
+        user_profiles = build_user_history_profiles(train_df, items, sampled_user_ids)
 
-    model = None
+    recall_models: Dict[str, Any] = {}
+    model_diagnostics: Dict[str, Any] = {}
     if any(strategy in BPR_STRATEGIES for strategy in strategies):
-        model = train_bpr_model(
+        bpr_model, bpr_diagnostics = train_bpr_model(
             user_item_matrix=user_item_matrix,
             factors=args.factors,
             iterations=args.iterations,
+            learning_rate=args.bpr_learning_rate,
+            regularization=args.bpr_regularization,
             seed=args.seed,
             show_progress=args.show_progress,
         )
+        recall_models["bpr"] = bpr_model
+        model_diagnostics["bpr"] = bpr_diagnostics
+    if any(strategy in ITEM_KNN_STRATEGIES for strategy in strategies):
+        item_knn_model, item_knn_diagnostics = train_item_knn_model(
+            user_item_matrix=user_item_matrix,
+            neighbors=args.item_knn_neighbors,
+            weighting=args.item_knn_weighting,
+            show_progress=args.show_progress,
+        )
+        recall_models["item_knn"] = item_knn_model
+        model_diagnostics["item_knn"] = item_knn_diagnostics
+
+    if args.recall_only:
+        all_recall_records: List[RecallEvalRecord] = []
+        summaries_by_strategy: Dict[str, Dict[str, Any]] = {}
+        completed_strategies: List[str] = []
+        for strategy in strategies:
+            LOGGER.info("Running scenario-1 recall-only strategy: %s", strategy)
+            strategy_start = time.time()
+            strategy_records = run_recall_only_evaluation(
+                strategy=strategy,
+                model=recall_models.get(strategy),
+                sampled_test=sampled_test,
+                mappings=mappings,
+                user_item_matrix=user_item_matrix,
+                train_by_user=train_by_user,
+                train_history_lengths=train_history_lengths,
+                popularity_scores=popularity_scores,
+                recall_k=args.recall_k,
+            )
+            strategy_summary = make_recall_only_summary(
+                strategy_records,
+                strategy=strategy,
+                recall_k=args.recall_k,
+            )
+            summaries_by_strategy[strategy] = strategy_summary
+            completed_strategies.append(strategy)
+            all_recall_records.extend(strategy_records)
+            log_recall_only_report(strategy_summary, args.recall_k)
+            LOGGER.info("Finished recall-only strategy %s in %.2f seconds.", strategy, time.time() - strategy_start)
+
+            checkpoint_summary = dict(strategy_summary)
+            if len(strategies) > 1:
+                checkpoint_summary.update(
+                    {
+                        "recall_strategy": args.recall_strategy,
+                        "primary_strategy": strategy,
+                        "num_strategies": len(strategies),
+                        "completed_strategy_count": len(completed_strategies),
+                    }
+                )
+            save_metrics_json(
+                args.output_json,
+                args,
+                all_recall_records,
+                checkpoint_summary,
+                summaries_by_strategy,
+                summaries_by_method_strategy={},
+                completed_strategies=completed_strategies,
+                diagnostics=model_diagnostics,
+            )
+
+        if len(strategies) == 1:
+            summary = summaries_by_strategy[strategies[0]]
+        else:
+            summary = make_recall_suite_summary(summaries_by_strategy, recall_k=args.recall_k)
+            summary.update(
+                {
+                    "recall_strategy": args.recall_strategy,
+                    "primary_strategy": "all",
+                    "num_strategies": len(strategies),
+                    "completed_strategy_count": len(completed_strategies),
+                }
+            )
+        save_metrics_json(
+            args.output_json,
+            args,
+            all_recall_records,
+            summary,
+            summaries_by_strategy,
+            summaries_by_method_strategy={},
+            completed_strategies=completed_strategies,
+            diagnostics=model_diagnostics,
+        )
+        return
 
     all_records: List[EvalRecord] = []
     summaries_by_strategy: Dict[str, Dict[str, Any]] = {}
@@ -1283,7 +1683,7 @@ def main() -> None:
         strategy_records = run_reranking_evaluation(
             strategy=strategy,
             methods=methods,
-            model=model,
+            model=recall_models.get(strategy),
             sampled_test=sampled_test,
             items=items,
             users=users,
@@ -1348,23 +1748,20 @@ def main() -> None:
         summary = summaries_by_strategy[strategies[0]]
     else:
         primary_method = "postprocessing" if "postprocessing" in methods else methods[0]
-        summary = summaries_by_strategy.get(
-            "ensemble",
-            make_summary(
-                [record for record in all_records if record.method == primary_method],
-                "all",
-                primary_method,
-                args.recall_k,
-                args.top_k,
-                args.hybrid_bpr_weight,
-                args.recall_backend,
-            ),
+        summary = make_summary(
+            [record for record in all_records if record.method == primary_method],
+            "all",
+            primary_method,
+            args.recall_k,
+            args.top_k,
+            args.hybrid_bpr_weight,
+            args.recall_backend,
         )
         summary = dict(summary)
         summary.update(
             {
                 "recall_strategy": args.recall_strategy,
-                "primary_strategy": "ensemble",
+                "primary_strategy": "all",
                 "num_strategies": len(strategies),
                 "completed_strategy_count": len(completed_strategies),
                 "recall_backend": args.recall_backend,
@@ -1379,6 +1776,7 @@ def main() -> None:
         summaries_by_strategy,
         summaries_by_method_strategy=summaries_by_method_strategy,
         completed_strategies=completed_strategies,
+        diagnostics=model_diagnostics,
     )
 
 
