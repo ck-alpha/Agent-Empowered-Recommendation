@@ -201,8 +201,8 @@ def plot_constraint_by_strategy(summary_df: pd.DataFrame, output_dir: Path, fmt:
     required = [
         "raw_top10_fully_repaired",
         "fully_repaired",
-        "raw_top10_inventory_safety_rate",
-        "agent_inventory_safety_rate",
+        "raw_top10_capacity_satisfaction_rate",
+        "agent_capacity_satisfaction_rate",
     ]
     missing = [col for col in required if col not in summary_df.columns]
     if missing:
@@ -216,15 +216,25 @@ def plot_constraint_by_strategy(summary_df: pd.DataFrame, output_dir: Path, fmt:
             [
                 {"strategy": strategy, "Metric": "CSR", "Layer": "Raw Top-10", "Score": row["raw_top10_fully_repaired"]},
                 {"strategy": strategy, "Metric": "CSR", "Layer": "Agent Top-10", "Score": row["fully_repaired"]},
-                {"strategy": strategy, "Metric": "Inventory", "Layer": "Raw Top-10", "Score": row["raw_top10_inventory_safety_rate"]},
-                {"strategy": strategy, "Metric": "Inventory", "Layer": "Agent Top-10", "Score": row["agent_inventory_safety_rate"]},
+                {
+                    "strategy": strategy,
+                    "Metric": "Capacity Rate",
+                    "Layer": "Raw Top-10",
+                    "Score": row["raw_top10_capacity_satisfaction_rate"],
+                },
+                {
+                    "strategy": strategy,
+                    "Metric": "Capacity Rate",
+                    "Layer": "Agent Top-10",
+                    "Score": row["agent_capacity_satisfaction_rate"],
+                },
             ]
         )
     plot_df = pd.DataFrame(rows)
 
     fig, axes = plt.subplots(1, 2, figsize=(max(9.2, 0.78 * summary_df[x_col].nunique()), 3.8), sharey=True)
     palette = {"Raw Top-10": "#A9B4C2", "Agent Top-10": "#1F6F8B"}
-    for ax, metric in zip(axes, ["CSR", "Inventory"]):
+    for ax, metric in zip(axes, ["CSR", "Capacity Rate"]):
         sub = plot_df[plot_df["Metric"] == metric]
         sns.barplot(data=sub, x="strategy", y="Score", hue="Layer", palette=palette, ax=ax)
         ax.set_title(metric)
@@ -233,7 +243,7 @@ def plot_constraint_by_strategy(summary_df: pd.DataFrame, output_dir: Path, fmt:
         ax.set_ylim(0, 1.08)
         ax.tick_params(axis="x", rotation=25)
         ax.legend(title="", loc="lower right", frameon=True)
-    fig.suptitle("Constraint Compliance by Recall Strategy", y=1.03, fontweight="bold")
+    fig.suptitle("Capacity Compliance by Recall Strategy", y=1.03, fontweight="bold")
     return save_figure(fig, output_dir, "scenario1_constraint_by_strategy", fmt, dpi)
 
 
@@ -242,8 +252,8 @@ def plot_constraint_improvement(summary: Dict[str, Any], output_dir: Path, fmt: 
     required = [
         "raw_top10_fully_repaired",
         "fully_repaired",
-        "raw_top10_inventory_safety_rate",
-        "agent_inventory_safety_rate",
+        "raw_top10_capacity_satisfaction_rate",
+        "agent_capacity_satisfaction_rate",
     ]
     missing = [key for key in required if key not in summary]
     if missing:
@@ -253,15 +263,23 @@ def plot_constraint_improvement(summary: Dict[str, Any], output_dir: Path, fmt: 
         [
             {"Metric": "CSR", "Layer": "Raw Top-10", "Score": float(summary["raw_top10_fully_repaired"])},
             {"Metric": "CSR", "Layer": "Agent Top-10", "Score": float(summary["fully_repaired"])},
-            {"Metric": "Inventory Safety", "Layer": "Raw Top-10", "Score": float(summary["raw_top10_inventory_safety_rate"])},
-            {"Metric": "Inventory Safety", "Layer": "Agent Top-10", "Score": float(summary["agent_inventory_safety_rate"])},
+            {
+                "Metric": "Capacity Rate",
+                "Layer": "Raw Top-10",
+                "Score": float(summary["raw_top10_capacity_satisfaction_rate"]),
+            },
+            {
+                "Metric": "Capacity Rate",
+                "Layer": "Agent Top-10",
+                "Score": float(summary["agent_capacity_satisfaction_rate"]),
+            },
         ]
     )
 
     fig, ax = plt.subplots(figsize=(6.4, 3.6))
     palette = {"Raw Top-10": "#A9B4C2", "Agent Top-10": "#1F6F8B"}
     sns.barplot(data=plot_df, x="Metric", y="Score", hue="Layer", palette=palette, ax=ax)
-    ax.set_title("Constraint Compliance Before and After Agent Reranking")
+    ax.set_title("Capacity Compliance Before and After Agent Reranking")
     ax.set_xlabel("")
     ax.set_ylabel("Rate")
     ax.set_ylim(0, 1.08)
@@ -300,77 +318,105 @@ def plot_recall_funnel(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi
     return save_figure(fig, output_dir, "scenario1_recall_funnel", fmt, dpi)
 
 
-def plot_budget_ndcg_tradeoff(records: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
-    """Scatter plot of Budget Penalty vs NDCG@10 with strategy-aware trend line."""
+def plot_capacity_overflow(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
+    """Compare capacity overflow before and after capacity handling."""
+    required = [
+        "raw_top10_capacity_violation_total",
+        "agent_capacity_violation_total",
+        "raw_top10_over_capacity_item_count",
+        "agent_over_capacity_item_count",
+    ]
+    missing = [col for col in required if col not in summary_df.columns]
+    if missing:
+        raise ValueError(f"Summary missing keys required for capacity overflow plot: {missing}")
+
+    x_col = _x_col(summary_df)
+    rows = []
+    for _, row in _to_numeric(summary_df, required).iterrows():
+        label = row[x_col]
+        rows.extend(
+            [
+                {
+                    "strategy": label,
+                    "Metric": "Overflow Total",
+                    "Layer": "Raw Top-10",
+                    "Value": row["raw_top10_capacity_violation_total"],
+                },
+                {
+                    "strategy": label,
+                    "Metric": "Overflow Total",
+                    "Layer": "Agent Top-10",
+                    "Value": row["agent_capacity_violation_total"],
+                },
+                {
+                    "strategy": label,
+                    "Metric": "Over-Cap Items",
+                    "Layer": "Raw Top-10",
+                    "Value": row["raw_top10_over_capacity_item_count"],
+                },
+                {
+                    "strategy": label,
+                    "Metric": "Over-Cap Items",
+                    "Layer": "Agent Top-10",
+                    "Value": row["agent_over_capacity_item_count"],
+                },
+            ]
+        )
+    plot_df = pd.DataFrame(rows)
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(9.2, 0.8 * summary_df[x_col].nunique()), 3.8))
+    palette = {"Raw Top-10": "#A9B4C2", "Agent Top-10": "#1F6F8B"}
+    for ax, metric in zip(axes, ["Overflow Total", "Over-Cap Items"]):
+        sub = plot_df[plot_df["Metric"] == metric]
+        sns.barplot(data=sub, x="strategy", y="Value", hue="Layer", palette=palette, ax=ax)
+        ax.set_title(metric)
+        ax.set_xlabel("")
+        ax.set_ylabel("Count")
+        ax.tick_params(axis="x", rotation=25)
+        ax.legend(title="", loc="upper right", frameon=True)
+    fig.suptitle("Capacity Overflow Reduction", y=1.03, fontweight="bold")
+    return save_figure(fig, output_dir, "scenario1_capacity_overflow", fmt, dpi)
+
+
+def plot_shortage_utility(records: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
+    """Show list-size shortage and final utility under capacity constraints."""
     hue_col = _x_col(records)
-    required = ["budget_penalty", "final_ndcg_at_10", hue_col]
+    required = [hue_col, "final_list_size", "candidate_shortage", "final_ndcg_at_10"]
     missing = [key for key in required if key not in records.columns]
     if missing:
-        raise ValueError(f"Records missing keys required for tradeoff plot: {missing}")
+        raise ValueError(f"Records missing keys required for shortage plot: {missing}")
 
-    plot_df = _to_numeric(records, ["budget_penalty", "final_ndcg_at_10"])[required].dropna()
-    if plot_df.empty:
-        raise ValueError("No valid rows for budget/NDCG tradeoff plot.")
+    df = _to_numeric(records, ["final_list_size", "candidate_shortage", "final_ndcg_at_10"])[required].dropna()
+    if df.empty:
+        raise ValueError("No valid rows for shortage/utility plot.")
+    grouped = df.groupby(hue_col, observed=True).agg(
+        final_list_size=("final_list_size", "mean"),
+        candidate_shortage=("candidate_shortage", "mean"),
+        final_ndcg_at_10=("final_ndcg_at_10", "mean"),
+    ).reset_index()
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.2))
-    sns.scatterplot(
-        data=plot_df,
-        x="budget_penalty",
-        y="final_ndcg_at_10",
-        hue=hue_col,
-        s=18,
-        alpha=0.30,
-        linewidth=0,
-        ax=ax,
+    plot_df = grouped.melt(
+        id_vars=hue_col,
+        value_vars=["final_list_size", "candidate_shortage", "final_ndcg_at_10"],
+        var_name="Metric",
+        value_name="Value",
+    )
+    plot_df["Metric"] = plot_df["Metric"].map(
+        {
+            "final_list_size": "Mean List Size",
+            "candidate_shortage": "Shortage Rate",
+            "final_ndcg_at_10": "NDCG@10",
+        }
     )
 
-    # Beauty is sparse; many NDCG values are 0. LOWESS trend avoids a black baseline blob.
-    try:
-        sns.regplot(
-            data=plot_df,
-            x="budget_penalty",
-            y="final_ndcg_at_10",
-            scatter=False,
-            lowess=True,
-            color="#D1495B",
-            line_kws={"linewidth": 2.0, "label": "LOWESS trend"},
-            ax=ax,
-        )
-    except Exception as exc:  # pragma: no cover - fallback depends on optional statsmodels.
-        LOGGER.warning("LOWESS trend failed (%s); falling back to linear trend.", exc)
-        sns.regplot(
-            data=plot_df,
-            x="budget_penalty",
-            y="final_ndcg_at_10",
-            scatter=False,
-            color="#D1495B",
-            line_kws={"linewidth": 2.0},
-            ax=ax,
-        )
-        if ax.lines:
-            ax.lines[-1].set_label("Linear trend")
-
-    if len(plot_df) >= 20 and plot_df["budget_penalty"].nunique() > 1 and plot_df["final_ndcg_at_10"].nunique() > 1:
-        try:
-            sns.kdeplot(
-                data=plot_df,
-                x="budget_penalty",
-                y="final_ndcg_at_10",
-                levels=4,
-                color="#444444",
-                linewidths=0.8,
-                alpha=0.35,
-                ax=ax,
-            )
-        except Exception as exc:  # pragma: no cover - depends on point distribution.
-            LOGGER.debug("KDE contour skipped: %s", exc)
-
-    ax.set_title("Utility-Constraint Trade-off: Budget Penalty vs. NDCG@10")
-    ax.set_xlabel("Budget Penalty (lower is better)")
-    ax.set_ylabel("NDCG@10 (higher is better)")
-    ax.set_ylim(-0.02, max(1.0, float(plot_df["final_ndcg_at_10"].max()) + 0.05))
-    ax.legend(title="Method/Strategy" if hue_col == "method_strategy" else "Strategy", loc="upper right", frameon=True, ncols=2)
-    return save_figure(fig, output_dir, "scenario1_budget_ndcg_tradeoff", fmt, dpi)
+    fig, ax = plt.subplots(figsize=(max(8.2, 0.72 * grouped[hue_col].nunique()), 4.0))
+    sns.barplot(data=plot_df, x=hue_col, y="Value", hue="Metric", ax=ax)
+    ax.set_title("Capacity Shortage and Utility")
+    ax.set_xlabel("Method / recall strategy" if hue_col == "method_strategy" else "Recall strategy")
+    ax.set_ylabel("Value")
+    ax.tick_params(axis="x", rotation=25)
+    ax.legend(title="", loc="upper right", frameon=True)
+    return save_figure(fig, output_dir, "scenario1_shortage_utility", fmt, dpi)
 
 
 def plot_swaps_vs_utility(records: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
@@ -406,7 +452,13 @@ def plot_swaps_vs_utility(records: pd.DataFrame, output_dir: Path, fmt: str, dpi
 
 
 def plot_method_constraint_utility_comparison(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
-    required = ["method", "final_ndcg_at_10", "fully_repaired", "budget_penalty", "entropy_penalty"]
+    required = [
+        "method",
+        "final_ndcg_at_10",
+        "fully_repaired",
+        "agent_capacity_violation_total",
+        "candidate_shortage",
+    ]
     missing = [col for col in required if col not in summary_df.columns]
     if missing:
         raise ValueError(f"Summary missing keys required for method comparison plot: {missing}")
@@ -414,7 +466,7 @@ def plot_method_constraint_utility_comparison(summary_df: pd.DataFrame, output_d
         LOGGER.info("Skipping method comparison plot because the metrics JSON has one method.")
         return output_dir / f"scenario1_method_constraint_utility_comparison.{fmt}"
 
-    metrics = ["final_ndcg_at_10", "fully_repaired", "budget_penalty", "entropy_penalty"]
+    metrics = ["final_ndcg_at_10", "fully_repaired", "agent_capacity_violation_total", "candidate_shortage"]
     plot_df = _to_numeric(summary_df, metrics).melt(
         id_vars=["method", "strategy"],
         value_vars=metrics,
@@ -426,13 +478,13 @@ def plot_method_constraint_utility_comparison(summary_df: pd.DataFrame, output_d
         {
             "final_ndcg_at_10": "NDCG@10",
             "fully_repaired": "CSR",
-            "budget_penalty": "Budget penalty",
-            "entropy_penalty": "Entropy penalty",
+            "agent_capacity_violation_total": "Capacity overflow",
+            "candidate_shortage": "Shortage rate",
         }
     )
 
     fig, axes = plt.subplots(2, 2, figsize=(10.2, 6.6))
-    for ax, metric in zip(axes.ravel(), ["NDCG@10", "CSR", "Budget penalty", "Entropy penalty"]):
+    for ax, metric in zip(axes.ravel(), ["NDCG@10", "CSR", "Capacity overflow", "Shortage rate"]):
         sub = plot_df[plot_df["Metric"] == metric]
         sns.barplot(data=sub, x="strategy", y="Score", hue="method", ax=ax)
         ax.set_title(metric)
@@ -461,7 +513,8 @@ def main() -> None:
     plot_constraint_by_strategy(summary_df, output_dir, args.format, args.dpi)
     plot_constraint_improvement(summary, output_dir, args.format, args.dpi)
     plot_recall_funnel(summary_df, output_dir, args.format, args.dpi)
-    plot_budget_ndcg_tradeoff(records, output_dir, args.format, args.dpi)
+    plot_capacity_overflow(summary_df, output_dir, args.format, args.dpi)
+    plot_shortage_utility(records, output_dir, args.format, args.dpi)
     plot_swaps_vs_utility(records, output_dir, args.format, args.dpi)
     plot_method_constraint_utility_comparison(summary_df, output_dir, args.format, args.dpi)
 

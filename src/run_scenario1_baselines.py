@@ -14,7 +14,7 @@ Recommended recall-only full command:
 This script evaluates a rigorous recommendation funnel:
 1) temporal train/test split with each user's last interaction as ground truth;
 2) recall strategies: BPR, Item-KNN, popularity;
-3) inverse mapping from implicit internal item ids back to original item_id;
+3) inverse mapping from internal contiguous item ids back to original item_id;
 4) feature join with scenario-1 synthesized item table;
 5) EcommercePostProcessingAgent constrained reranking;
 6) final constraint and accuracy report, persisted as JSON for plotting.
@@ -39,9 +39,11 @@ from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
 try:
-    from implicit.bpr import BayesianPersonalizedRanking
+    import torch
+    import torch.nn.functional as F
 except ImportError:  # pragma: no cover - exercised only when optional dependency is absent.
-    BayesianPersonalizedRanking = None
+    torch = None
+    F = None
 
 try:
     from implicit.nearest_neighbours import BM25Recommender, CosineRecommender, TFIDFRecommender
@@ -59,6 +61,7 @@ from agents import (
     EcommercePostProcessingAgent,
     EcommercePostProcessingConfig,
 )
+from constraints import EcommerceConstraintConfig, EcommerceConstraintHandler
 
 LOGGER = logging.getLogger(__name__)
 RANDOM_SEED = 42
@@ -68,17 +71,13 @@ BPR_STRATEGIES = {"bpr"}
 ITEM_KNN_STRATEGIES = {"item_knn"}
 REQUIRED_ITEM_COLUMNS = [
     "item_id",
-    "stockout_risk",
-    "is_new",
-    "seller_id",
-    "brand_id",
-    "price_filled",
+    "inventory_initial",
 ]
 
 
 @dataclass
 class IdMappings:
-    """Continuous integer id mappings required by implicit."""
+    """Continuous integer id mappings required by matrix-based recall models."""
 
     user_id_to_idx: Dict[str, int]
     idx_to_user_id: Dict[int, str]
@@ -122,20 +121,28 @@ class EvalRecord:
     recall_hit_at_k: float
     raw_top10_hit_at_10: float
     raw_top10_ndcg_at_10: float
-    raw_top10_inventory_safety_rate: float
+    raw_top10_capacity_satisfaction_rate: float
+    raw_top10_capacity_violation_total: float
+    raw_top10_over_capacity_item_count: int
     raw_top10_fully_repaired: bool
-    agent_inventory_safety_rate: float
+    agent_capacity_satisfaction_rate: float
+    agent_capacity_violation_total: float
+    agent_over_capacity_item_count: int
+    agent_max_capacity_overflow: float
+    agent_mean_item_utilization: float
     fully_repaired: bool
     num_swaps: int
     search_steps: int
-    budget_penalty: float
-    entropy_penalty: float
-    final_new_item_count: int
-    final_seller_count: int
+    local_search_moves: int
     candidate_shortage: bool
     final_list_size: int
+    final_utility: float
+    raw_final_overlap_rate: float
+    changed_item_count: int
     final_hit_at_10: float
     final_ndcg_at_10: float
+    raw_item_ids: List[str]
+    final_item_ids: List[str]
 
 
 @dataclass
@@ -169,10 +176,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_users", type=int, default=1000, help="Maximum number of eligible users to evaluate.")
     parser.add_argument("--recall_k", type=int, default=200, help="Recall size before reranking.")
     parser.add_argument("--top_k", type=int, default=10, help="Final recommendation list length.")
-    parser.add_argument("--factors", type=int, default=64, help="BPR latent factor dimension.")
-    parser.add_argument("--iterations", type=int, default=300, help="BPR training iterations.")
-    parser.add_argument("--bpr_learning_rate", type=float, default=0.05, help="BPR SGD learning rate.")
-    parser.add_argument("--bpr_regularization", type=float, default=0.1, help="BPR regularization strength.")
+    parser.add_argument("--factors", type=int, default=128, help="BPR latent factor dimension.")
+    parser.add_argument("--iterations", type=int, default=100, help="BPR training epochs.")
+    parser.add_argument("--bpr_learning_rate", type=float, default=0.001, help="BPR optimizer learning rate.")
+    parser.add_argument("--bpr_regularization", type=float, default=0.0001, help="BPR explicit L2 regularization strength.")
+    parser.add_argument("--bpr_batch_size", type=int, default=8192, help="BPR pairwise training batch size.")
+    parser.add_argument(
+        "--bpr_optimizer",
+        choices=["adam", "sgd"],
+        default="adam",
+        help="BPR optimizer for the PyTorch implementation.",
+    )
+    parser.add_argument(
+        "--bpr_negative_sampler",
+        choices=["uniform", "popularity", "mixed"],
+        default="uniform",
+        help="BPR negative sampler: uniform, popularity^0.75, or a 50/50 mix.",
+    )
     parser.add_argument("--item_knn_neighbors", type=int, default=100, help="Item-KNN neighbor count.")
     parser.add_argument(
         "--item_knn_weighting",
@@ -202,7 +222,7 @@ def parse_args() -> argparse.Namespace:
         help="Constrained baseline layer to evaluate.",
     )
     parser.add_argument("--recall_only", action="store_true", help="Only evaluate recall metrics; skip processing agents.")
-    parser.add_argument("--show_progress", action="store_true", help="Show implicit BPR training progress.")
+    parser.add_argument("--show_progress", action="store_true", help="Show BPR / Item-KNN training progress.")
     return parser.parse_args()
 
 
@@ -214,13 +234,20 @@ def resolve_methods(baseline_mode: str) -> List[str]:
     return ["postprocessing", "inprocessing"] if baseline_mode == "both" else [baseline_mode]
 
 
-def ensure_implicit_available(required: bool = True, *, require_bpr: bool = False, require_item_knn: bool = False) -> None:
+def ensure_torch_available(required: bool = True) -> None:
+    """Fail fast when the PyTorch BPR backend is required but unavailable."""
+    if required and torch is None:
+        raise RuntimeError(
+            "Missing dependency module: torch. Install the LLM_Rec PyTorch environment, for example:\n"
+            "  conda run -n LLM_Rec python -m pip install torch --index-url https://download.pytorch.org/whl/cu128"
+        )
+
+
+def ensure_implicit_available(required: bool = True, *, require_item_knn: bool = False) -> None:
     """Fail fast with an actionable message when implicit is required but not installed."""
     if not required:
         return
     missing = []
-    if require_bpr and BayesianPersonalizedRanking is None:
-        missing.append("implicit.bpr")
     if require_item_knn and BM25Recommender is None:
         missing.append("implicit.nearest_neighbours")
     if missing:
@@ -302,7 +329,7 @@ def temporal_train_test_split(interactions: pd.DataFrame, min_user_interactions:
 
 
 def build_id_mappings(train_interactions: pd.DataFrame) -> IdMappings:
-    """Build continuous user/item id mappings for implicit BPR."""
+    """Build continuous user/item id mappings for matrix-based recall models."""
     user_ids = train_interactions["user_id"].dropna().astype(str).drop_duplicates().tolist()
     item_ids = train_interactions["item_id"].dropna().astype(str).drop_duplicates().tolist()
 
@@ -317,7 +344,7 @@ def build_id_mappings(train_interactions: pd.DataFrame) -> IdMappings:
 
 
 def build_user_item_matrix(train_interactions: pd.DataFrame, mappings: IdMappings) -> csr_matrix:
-    """Build CSR user-item implicit feedback matrix."""
+    """Build CSR user-item feedback matrix."""
     mapped = train_interactions[["user_id", "item_id"]].copy()
     mapped["user_idx"] = mapped["user_id"].map(mappings.user_id_to_idx)
     mapped["item_idx"] = mapped["item_id"].map(mappings.item_id_to_idx)
@@ -335,6 +362,96 @@ def build_user_item_matrix(train_interactions: pd.DataFrame, mappings: IdMapping
     return matrix
 
 
+class TorchBPRRecommender:
+    """PyTorch BPR recommender exposed with an implicit-like recommend API."""
+
+    def __init__(self, user_factors: Any, item_factors: Any, device: str) -> None:
+        self.device = torch.device(device)
+        self.user_factors = user_factors.detach().to(self.device)
+        self.item_factors = item_factors.detach().to(self.device)
+
+    def recommend(
+        self,
+        user_idx: int,
+        user_items: csr_matrix,
+        N: int,
+        filter_already_liked_items: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        with torch.no_grad():
+            user_vector = self.user_factors[int(user_idx)]
+            scores = torch.mv(self.item_factors, user_vector)
+            if filter_already_liked_items:
+                liked = getattr(user_items, "indices", np.array([], dtype=np.int64))
+                if len(liked):
+                    liked_tensor = torch.as_tensor(liked, dtype=torch.long, device=self.device)
+                    scores[liked_tensor] = -torch.inf
+            top_n = min(max(1, int(N)), int(scores.numel()))
+            values, indices = torch.topk(scores, k=top_n)
+        return indices.detach().cpu().numpy(), values.detach().cpu().numpy()
+
+
+def _build_user_positive_sets(user_item_matrix: csr_matrix) -> List[set]:
+    matrix = user_item_matrix.tocsr()
+    return [
+        set(matrix.indices[matrix.indptr[user_idx] : matrix.indptr[user_idx + 1]].astype(int).tolist())
+        for user_idx in range(matrix.shape[0])
+    ]
+
+
+def _make_negative_sampler(
+    user_item_matrix: csr_matrix,
+    user_positive_sets: Sequence[set],
+    sampler: str,
+    seed: int,
+) -> Any:
+    rng = np.random.default_rng(seed)
+    num_items = int(user_item_matrix.shape[1])
+    sampler = str(sampler).lower()
+    item_counts = np.asarray(user_item_matrix.sum(axis=0)).reshape(-1).astype(float)
+    popularity = np.power(item_counts + EPS, 0.75)
+    popularity = popularity / max(float(popularity.sum()), EPS)
+
+    def draw(size: int) -> np.ndarray:
+        if sampler == "popularity":
+            return rng.choice(num_items, size=size, replace=True, p=popularity).astype(np.int64)
+        if sampler == "mixed":
+            mask = rng.random(size) < 0.5
+            out = rng.integers(0, num_items, size=size, dtype=np.int64)
+            if mask.any():
+                out[mask] = rng.choice(num_items, size=int(mask.sum()), replace=True, p=popularity).astype(np.int64)
+            return out
+        if sampler != "uniform":
+            raise ValueError(f"Unsupported BPR negative sampler: {sampler}")
+        return rng.integers(0, num_items, size=size, dtype=np.int64)
+
+    def sample(users: np.ndarray) -> np.ndarray:
+        negatives = draw(len(users))
+        conflicts = np.array(
+            [int(item) in user_positive_sets[int(user)] for user, item in zip(users, negatives)],
+            dtype=bool,
+        )
+        attempts = 0
+        while conflicts.any() and attempts < 20:
+            negatives[conflicts] = draw(int(conflicts.sum()))
+            conflicts = np.array(
+                [int(item) in user_positive_sets[int(user)] for user, item in zip(users, negatives)],
+                dtype=bool,
+            )
+            attempts += 1
+        if conflicts.any():
+            for idx in np.where(conflicts)[0]:
+                positives = user_positive_sets[int(users[idx])]
+                if len(positives) >= num_items:
+                    continue
+                candidate = int(rng.integers(0, num_items))
+                while candidate in positives:
+                    candidate = int(rng.integers(0, num_items))
+                negatives[idx] = candidate
+        return negatives
+
+    return sample
+
+
 def train_bpr_model(
     user_item_matrix: csr_matrix,
     factors: int,
@@ -343,55 +460,134 @@ def train_bpr_model(
     regularization: float,
     seed: int,
     show_progress: bool,
+    batch_size: int = 8192,
+    optimizer_name: str = "adam",
+    negative_sampler: str = "uniform",
 ) -> Tuple[Any, Dict[str, Any]]:
-    """Train implicit BPR recall model."""
-    ensure_implicit_available(required=True, require_bpr=True)
-    model = BayesianPersonalizedRanking(
-        factors=factors,
-        iterations=iterations,
-        learning_rate=learning_rate,
-        regularization=regularization,
-        random_state=seed,
-    )
+    """Train the project BPR recall model with PyTorch."""
+    ensure_torch_available(required=True)
+    if F is None:
+        raise RuntimeError("torch.nn.functional is unavailable.")
+    user_item_matrix = user_item_matrix.tocsr()
+    num_users, num_items = user_item_matrix.shape
+    if user_item_matrix.nnz <= 0:
+        raise ValueError("Cannot train BPR from an empty user-item matrix.")
+
+    factors = max(1, int(factors))
+    iterations = max(1, int(iterations))
+    batch_size = max(1, int(batch_size))
+    optimizer_name = str(optimizer_name).lower()
+    negative_sampler = str(negative_sampler).lower()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    coo = user_item_matrix.tocoo()
+    pair_users = coo.row.astype(np.int64)
+    pair_items = coo.col.astype(np.int64)
+    user_positive_sets = _build_user_positive_sets(user_item_matrix)
+    sample_negatives = _make_negative_sampler(user_item_matrix, user_positive_sets, negative_sampler, seed + 17)
+
+    user_embedding = torch.nn.Embedding(num_users, factors).to(device)
+    item_embedding = torch.nn.Embedding(num_items, factors).to(device)
+    torch.nn.init.normal_(user_embedding.weight, mean=0.0, std=0.01)
+    torch.nn.init.normal_(item_embedding.weight, mean=0.0, std=0.01)
+    params = list(user_embedding.parameters()) + list(item_embedding.parameters())
+    if optimizer_name == "adam":
+        optimizer = torch.optim.Adam(params, lr=float(learning_rate))
+    elif optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(params, lr=float(learning_rate))
+    else:
+        raise ValueError(f"Unsupported BPR optimizer: {optimizer_name}")
+
     LOGGER.info(
-        "Training BPR: users=%s, items=%s, nnz=%s, factors=%s, iterations=%s, learning_rate=%.4f, regularization=%.4f",
-        user_item_matrix.shape[0],
-        user_item_matrix.shape[1],
+        "Training BPR (PyTorch): users=%s, items=%s, nnz=%s, factors=%s, epochs=%s, "
+        "batch_size=%s, optimizer=%s, learning_rate=%.6f, regularization=%.6f, sampler=%s, device=%s",
+        num_users,
+        num_items,
         user_item_matrix.nnz,
         factors,
         iterations,
+        batch_size,
+        optimizer_name,
         learning_rate,
         regularization,
+        negative_sampler,
+        device,
     )
     diagnostics: Dict[str, Any] = {
         "model": "bpr",
-        "users": int(user_item_matrix.shape[0]),
-        "items": int(user_item_matrix.shape[1]),
+        "implementation": "pytorch",
+        "users": int(num_users),
+        "items": int(num_items),
         "nnz": int(user_item_matrix.nnz),
         "factors": int(factors),
-        "iterations": int(iterations),
+        "epochs": int(iterations),
+        "batch_size": int(batch_size),
+        "optimizer": optimizer_name,
         "learning_rate": float(learning_rate),
         "regularization": float(regularization),
+        "negative_sampler": negative_sampler,
+        "device": device,
+        "torch_version": str(torch.__version__),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
     }
 
-    def callback(epoch: int, elapsed: float, correct: int, skipped: int) -> None:
-        usable = max(0, int(user_item_matrix.nnz) - int(skipped))
-        train_auc = float(correct / usable) if usable > 0 else None
+    rng = np.random.default_rng(seed)
+    epoch_iter = range(1, iterations + 1)
+    if show_progress:
+        epoch_iter = tqdm(epoch_iter, desc="Training BPR", leave=False)
+    start = time.time()
+    for epoch in epoch_iter:
+        order = rng.permutation(len(pair_users))
+        total_loss = 0.0
+        total_auc = 0.0
+        total_examples = 0
+        for start_idx in range(0, len(order), batch_size):
+            batch_idx = order[start_idx : start_idx + batch_size]
+            users_np = pair_users[batch_idx]
+            pos_np = pair_items[batch_idx]
+            neg_np = sample_negatives(users_np)
+
+            users = torch.as_tensor(users_np, dtype=torch.long, device=device)
+            positives = torch.as_tensor(pos_np, dtype=torch.long, device=device)
+            negatives = torch.as_tensor(neg_np, dtype=torch.long, device=device)
+
+            user_vec = user_embedding(users)
+            pos_vec = item_embedding(positives)
+            neg_vec = item_embedding(negatives)
+            pos_scores = (user_vec * pos_vec).sum(dim=1)
+            neg_scores = (user_vec * neg_vec).sum(dim=1)
+            loss = -F.logsigmoid(pos_scores - neg_scores).mean()
+            if regularization > 0:
+                l2 = user_vec.pow(2).sum() + pos_vec.pow(2).sum() + neg_vec.pow(2).sum()
+                loss = loss + float(regularization) * l2 / max(1, len(batch_idx))
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            batch_n = int(len(batch_idx))
+            total_loss += float(loss.detach().cpu()) * batch_n
+            total_auc += float((pos_scores.detach() > neg_scores.detach()).float().sum().cpu())
+            total_examples += batch_n
+
         row = {
             "epoch": int(epoch),
-            "elapsed_seconds": float(elapsed),
-            "train_auc": train_auc,
-            "skipped_ratio": float(skipped / max(1, int(user_item_matrix.nnz))),
-            "correct_pairs": int(correct),
-            "skipped_pairs": int(skipped),
+            "train_loss": float(total_loss / max(1, total_examples)),
+            "sampled_train_auc": float(total_auc / max(1, total_examples)),
+            "elapsed_seconds": float(time.time() - start),
         }
-        if epoch == 0:
+        if epoch == 1:
             diagnostics["first_epoch"] = row
         diagnostics["last_epoch"] = row
+        if show_progress and hasattr(epoch_iter, "set_postfix"):
+            epoch_iter.set_postfix(loss=f"{row['train_loss']:.4f}", auc=f"{row['sampled_train_auc']:.4f}")
 
-    start = time.time()
-    model.fit(user_item_matrix, show_progress=show_progress, callback=callback)
     diagnostics["fit_seconds"] = float(time.time() - start)
+    model = TorchBPRRecommender(user_embedding.weight, item_embedding.weight, device)
     return model, diagnostics
 
 
@@ -591,7 +787,7 @@ def build_user_history_profiles(
 
 
 def _normalize_recommend_result(item_indices: Any, scores: Any) -> Tuple[np.ndarray, np.ndarray]:
-    """Normalize implicit recommend output across minor version differences."""
+    """Normalize recommend output into flat arrays."""
     item_indices = np.asarray(item_indices).reshape(-1)
     scores = np.asarray(scores).reshape(-1)
     if len(item_indices) != len(scores):
@@ -622,7 +818,7 @@ def recall_bpr_candidates(
     original_item_ids: List[str] = []
     valid_scores: List[float] = []
     for internal_idx, score in zip(internal_item_indices, scores):
-        # Critical inverse transform: implicit returns internal contiguous ids, not original item_id.
+        # Critical inverse transform: models return internal contiguous ids, not original item_id.
         item_id = mappings.idx_to_item_id.get(int(internal_idx))
         if item_id is None:
             LOGGER.warning("Skip unmapped internal item id from BPR: %s", internal_idx)
@@ -1104,31 +1300,40 @@ def sample_test_users(test_df: pd.DataFrame, mappings: IdMappings, test_users: i
     return eligible.sample(n=n, random_state=seed).reset_index(drop=True)
 
 
-def evaluate_raw_topk(
-    candidate_df: pd.DataFrame,
-    user_budget_info: pd.Series,
-    ground_truth_item_id: str,
-    top_k: int,
-) -> Dict[str, float]:
-    """Evaluate unconstrained recall-layer Top-K before Agent reranking."""
-    if candidate_df.empty:
-        return {
-            "inventory_safety_rate": 0.0,
-            "fully_repaired": 0.0,
-            "hit_at_10": 0.0,
-            "ndcg_at_10": 0.0,
-        }
-    raw_topk = candidate_df.sort_values("base_score", ascending=False).head(top_k).copy()
-    raw_items = raw_topk["item_id"].astype(str).tolist()
-    raw_hr, raw_ndcg = compute_hr_ndcg_at_k(raw_items, ground_truth_item_id, top_k)
-    agent = EcommercePostProcessingAgent(EcommercePostProcessingConfig(top_k=top_k))
-    diagnostics = agent.constraint_handler.evaluate_all(raw_topk, user_budget_info=user_budget_info)
-    return {
-        "inventory_safety_rate": float(diagnostics.get("inventory_pass_rate", 0.0)),
-        "fully_repaired": float(diagnostics.get("all_hard_constraints_satisfied", False)),
-        "hit_at_10": float(raw_hr),
-        "ndcg_at_10": float(raw_ndcg),
-    }
+def build_raw_topk_recommendations(candidate_df: pd.DataFrame, top_k: int) -> pd.DataFrame:
+    """Build unconstrained per-user Top-K recommendations before capacity handling."""
+    if candidate_df.empty or top_k <= 0:
+        out = candidate_df.head(0).copy()
+        out["rank"] = pd.Series(dtype=int)
+        return out
+    required = ["user_id", "item_id", "base_score"]
+    missing = [col for col in required if col not in candidate_df.columns]
+    if missing:
+        raise ValueError(f"candidate_df missing columns for raw Top-K: {missing}")
+    ranked = candidate_df.sort_values(["user_id", "base_score", "item_id"], ascending=[True, False, True]).copy()
+    raw = ranked.groupby("user_id", sort=False).head(top_k).copy()
+    raw["rank"] = raw.groupby("user_id").cumcount() + 1
+    return raw.reset_index(drop=True)
+
+
+def item_ids_for_user(recommendations: pd.DataFrame, user_id: str) -> List[str]:
+    """Return a user's recommended item ids in rank order."""
+    if recommendations.empty or "user_id" not in recommendations.columns:
+        return []
+    rows = recommendations.loc[recommendations["user_id"].astype(str) == str(user_id)].copy()
+    if rows.empty:
+        return []
+    if "rank" in rows.columns:
+        rows = rows.sort_values(["rank", "item_id"], ascending=[True, True])
+    else:
+        rows = rows.sort_values(["base_score", "item_id"], ascending=[False, True])
+    return rows["item_id"].astype(str).tolist()
+
+
+def evaluate_capacity_constraints(recommendations: pd.DataFrame) -> Dict[str, Any]:
+    """Evaluate scenario-1 capacity-only hard constraints for a recommendation matrix."""
+    handler = EcommerceConstraintHandler(EcommerceConstraintConfig(capacity_col="inventory_initial"))
+    return handler.evaluate_all(recommendations)
 
 
 def run_reranking_evaluation(
@@ -1151,8 +1356,8 @@ def run_reranking_evaluation(
     recall_backend: str,
     recall_cache: Optional[RecallCache],
 ) -> List[EvalRecord]:
-    """Run recall and constrained processing baselines for sampled users."""
-    users_by_id = users.set_index("user_id", drop=False)
+    """Run recall and batch-level capacity-only processing baselines for sampled users."""
+    del users
     agents = {
         "postprocessing": EcommercePostProcessingAgent(EcommercePostProcessingConfig(top_k=top_k)),
         "inprocessing": EcommerceInProcessingAgent(EcommerceInProcessingConfig(top_k=top_k, random_seed=seed)),
@@ -1162,18 +1367,14 @@ def run_reranking_evaluation(
         raise ValueError(f"No supported baseline methods selected: {methods}")
 
     records: List[EvalRecord] = []
-    skipped_no_budget = 0
     skipped_no_recall = 0
+    user_rows: List[Dict[str, Any]] = []
+    candidate_frames: List[pd.DataFrame] = []
 
-    desc = f"Evaluating users [{strategy} | {','.join(selected_methods)}]"
+    desc = f"Collecting candidates [{strategy}]"
     for row in tqdm(sampled_test.itertuples(index=False), total=len(sampled_test), desc=desc):
         user_id = str(row.user_id)
         ground_truth = str(row.item_id)
-
-        if user_id not in users_by_id.index:
-            skipped_no_budget += 1
-            continue
-        user_budget_info = users_by_id.loc[user_id, ["target_budget", "budget_tolerance"]]
 
         recall_df = recall_candidates(
             strategy=strategy,
@@ -1185,7 +1386,7 @@ def run_reranking_evaluation(
             popularity_scores=popularity_scores,
             item_catalog=item_catalog,
             user_profiles=user_profiles,
-            user_budget_info=user_budget_info,
+            user_budget_info=pd.Series(dtype=float),
             recall_k=recall_k,
             hybrid_bpr_weight=hybrid_bpr_weight,
             seed=seed,
@@ -1204,60 +1405,106 @@ def run_reranking_evaluation(
         if candidate_df.empty:
             skipped_no_recall += 1
             continue
+        candidate_df = candidate_df.copy()
+        candidate_df["user_id"] = user_id
 
-        raw_eval = evaluate_raw_topk(
-            candidate_df,
-            user_budget_info=user_budget_info,
-            ground_truth_item_id=ground_truth,
+        recall_hr, _ = compute_hr_ndcg_at_k(recall_df["item_id"].astype(str).tolist(), ground_truth, recall_k)
+        user_rows.append(
+            {
+                "user_id": user_id,
+                "ground_truth": ground_truth,
+                "recall_count": int(len(recall_df)),
+                "recall_hit_at_k": float(recall_hr),
+            }
+        )
+        candidate_frames.append(candidate_df)
+
+    if skipped_no_recall:
+        LOGGER.warning("[%s] Skipped %s users because recall/feature join returned no candidates.", strategy, skipped_no_recall)
+    if not user_rows or not candidate_frames:
+        return records
+
+    all_candidates = pd.concat(candidate_frames, ignore_index=True)
+    user_order = [row["user_id"] for row in user_rows]
+    raw_recs = build_raw_topk_recommendations(all_candidates, top_k=top_k)
+    raw_constraints = evaluate_capacity_constraints(raw_recs)
+    raw_capacity_rate = float(raw_constraints.get("capacity_satisfaction_rate", 0.0))
+    raw_capacity_violation = float(raw_constraints.get("capacity_violation_total", 0.0))
+    raw_over_capacity_count = int(raw_constraints.get("over_capacity_item_count", 0))
+    raw_fully_repaired = bool(raw_constraints.get("all_hard_constraints_satisfied", False))
+
+    raw_accuracy: Dict[str, Tuple[float, float]] = {}
+    for info in user_rows:
+        raw_items = item_ids_for_user(raw_recs, info["user_id"])
+        raw_accuracy[info["user_id"]] = compute_hr_ndcg_at_k(raw_items, info["ground_truth"], top_k)
+
+    for method in selected_methods:
+        LOGGER.info("[%s] Running scenario-1 capacity baseline: %s", strategy, method)
+        result = agents[method].recommend_batch(
+            candidate_items=all_candidates,
+            user_ids=user_order,
             top_k=top_k,
         )
-        recall_hr, _ = compute_hr_ndcg_at_k(recall_df["item_id"].astype(str).tolist(), ground_truth, recall_k)
+        diagnostics = result.get("diagnostics", {})
+        recommendations = result.get("recommendations", pd.DataFrame()).copy()
+        final_constraints = diagnostics.get("final_constraints", {})
+        agent_capacity_rate = float(final_constraints.get("capacity_satisfaction_rate", 0.0))
+        agent_capacity_violation = float(final_constraints.get("capacity_violation_total", 0.0))
+        agent_over_capacity_count = int(final_constraints.get("over_capacity_item_count", 0))
+        agent_max_overflow = float(final_constraints.get("max_capacity_overflow", 0.0))
+        agent_mean_utilization = float(final_constraints.get("mean_item_utilization", 0.0))
 
-        for method in selected_methods:
-            result = agents[method].recommend(
-                user_id=user_id,
-                candidate_items=candidate_df,
-                user_budget_info=user_budget_info,
-                top_k=top_k,
-            )
-            diagnostics = result.get("diagnostics", {})
-            final_items = [str(item_id) for item_id in result.get("item_ids", [])]
+        final_counts = (
+            recommendations["user_id"].astype(str).value_counts().astype(int).to_dict()
+            if not recommendations.empty and "user_id" in recommendations.columns
+            else {}
+        )
+
+        for info in user_rows:
+            user_id = info["user_id"]
+            ground_truth = info["ground_truth"]
+            final_items = item_ids_for_user(recommendations, user_id)
             final_hr, final_ndcg = compute_hr_ndcg_at_k(final_items, ground_truth, top_k)
-
-            final_constraints = diagnostics.get("final_constraints", {})
-            agent_inventory_safety_rate = float(final_constraints.get("inventory_pass_rate", 0.0))
-
+            raw_hr, raw_ndcg = raw_accuracy.get(user_id, (0.0, 0.0))
+            raw_items = item_ids_for_user(raw_recs, user_id)
+            raw_item_set = set(raw_items)
+            final_item_set = set(final_items)
+            overlap_count = len(raw_item_set & final_item_set)
+            overlap_denominator = max(1, len(raw_item_set))
             records.append(
                 EvalRecord(
                     strategy=strategy,
                     method=method,
                     user_id=user_id,
                     ground_truth_item_id=ground_truth,
-                    recall_count=int(len(recall_df)),
-                    recall_hit_at_k=float(recall_hr),
-                    raw_top10_hit_at_10=float(raw_eval["hit_at_10"]),
-                    raw_top10_ndcg_at_10=float(raw_eval["ndcg_at_10"]),
-                    raw_top10_inventory_safety_rate=float(raw_eval["inventory_safety_rate"]),
-                    raw_top10_fully_repaired=bool(raw_eval["fully_repaired"]),
-                    agent_inventory_safety_rate=float(agent_inventory_safety_rate),
+                    recall_count=int(info["recall_count"]),
+                    recall_hit_at_k=float(info["recall_hit_at_k"]),
+                    raw_top10_hit_at_10=float(raw_hr),
+                    raw_top10_ndcg_at_10=float(raw_ndcg),
+                    raw_top10_capacity_satisfaction_rate=raw_capacity_rate,
+                    raw_top10_capacity_violation_total=raw_capacity_violation,
+                    raw_top10_over_capacity_item_count=raw_over_capacity_count,
+                    raw_top10_fully_repaired=raw_fully_repaired,
+                    agent_capacity_satisfaction_rate=agent_capacity_rate,
+                    agent_capacity_violation_total=agent_capacity_violation,
+                    agent_over_capacity_item_count=agent_over_capacity_count,
+                    agent_max_capacity_overflow=agent_max_overflow,
+                    agent_mean_item_utilization=agent_mean_utilization,
                     fully_repaired=bool(diagnostics.get("fully_repaired", False)),
                     num_swaps=int(diagnostics.get("num_swaps", 0)),
                     search_steps=int(diagnostics.get("search_steps", 0)),
-                    budget_penalty=float(diagnostics.get("final_budget_penalty", 0.0)),
-                    entropy_penalty=float(diagnostics.get("final_entropy_penalty", 0.0)),
-                    final_new_item_count=int(diagnostics.get("final_new_item_count", 0)),
-                    final_seller_count=int(diagnostics.get("final_seller_count", 0)),
-                    candidate_shortage=bool(diagnostics.get("candidate_shortage", False)),
+                    local_search_moves=int(diagnostics.get("local_search_moves", 0)),
+                    candidate_shortage=int(final_counts.get(user_id, 0)) < top_k,
                     final_list_size=len(final_items),
+                    final_utility=float(diagnostics.get("final_utility", 0.0)),
+                    raw_final_overlap_rate=float(overlap_count / overlap_denominator),
+                    changed_item_count=int(max(len(raw_item_set), len(final_item_set)) - overlap_count),
                     final_hit_at_10=float(final_hr),
                     final_ndcg_at_10=float(final_ndcg),
+                    raw_item_ids=raw_items,
+                    final_item_ids=final_items,
                 )
             )
-
-    if skipped_no_budget:
-        LOGGER.warning("[%s] Skipped %s users because budget features were missing.", strategy, skipped_no_budget)
-    if skipped_no_recall:
-        LOGGER.warning("[%s] Skipped %s users because recall/feature join returned no candidates.", strategy, skipped_no_recall)
     return records
 
 
@@ -1333,18 +1580,24 @@ def _mean_dict(records: List[EvalRecord]) -> Dict[str, float]:
         "recall_hit_at_k",
         "raw_top10_hit_at_10",
         "raw_top10_ndcg_at_10",
-        "raw_top10_inventory_safety_rate",
+        "raw_top10_capacity_satisfaction_rate",
+        "raw_top10_capacity_violation_total",
+        "raw_top10_over_capacity_item_count",
         "raw_top10_fully_repaired",
-        "agent_inventory_safety_rate",
+        "agent_capacity_satisfaction_rate",
+        "agent_capacity_violation_total",
+        "agent_over_capacity_item_count",
+        "agent_max_capacity_overflow",
+        "agent_mean_item_utilization",
         "fully_repaired",
         "num_swaps",
         "search_steps",
-        "budget_penalty",
-        "entropy_penalty",
-        "final_new_item_count",
-        "final_seller_count",
+        "local_search_moves",
         "candidate_shortage",
         "final_list_size",
+        "final_utility",
+        "raw_final_overlap_rate",
+        "changed_item_count",
         "final_hit_at_10",
         "final_ndcg_at_10",
     ]
@@ -1491,15 +1744,19 @@ def log_final_report(summary: Dict[str, Any], recall_k: int, top_k: int) -> None
     LOGGER.info("Final NDCG@%d                      : %.4f", top_k, summary.get("final_ndcg_at_10", 0.0))
     LOGGER.info("Recall-layer CSR@Top-%d            : %.4f", top_k, summary.get("raw_top10_fully_repaired", 0.0))
     LOGGER.info("Agent CSR@Top-%d                   : %.4f", top_k, summary.get("fully_repaired", 0.0))
-    LOGGER.info("Recall-layer inventory safety      : %.4f", summary.get("raw_top10_inventory_safety_rate", 0.0))
-    LOGGER.info("Agent inventory safety             : %.4f", summary.get("agent_inventory_safety_rate", 0.0))
+    LOGGER.info("Recall-layer capacity satisfaction : %.4f", summary.get("raw_top10_capacity_satisfaction_rate", 0.0))
+    LOGGER.info("Agent capacity satisfaction        : %.4f", summary.get("agent_capacity_satisfaction_rate", 0.0))
+    LOGGER.info("Recall-layer capacity overflow     : %.4f", summary.get("raw_top10_capacity_violation_total", 0.0))
+    LOGGER.info("Agent capacity overflow            : %.4f", summary.get("agent_capacity_violation_total", 0.0))
+    LOGGER.info("Agent over-capacity item count     : %.4f", summary.get("agent_over_capacity_item_count", 0.0))
+    LOGGER.info("Agent mean item utilization        : %.4f", summary.get("agent_mean_item_utilization", 0.0))
     LOGGER.info("Average swaps                      : %.4f", summary.get("num_swaps", 0.0))
     LOGGER.info("Average search steps               : %.4f", summary.get("search_steps", 0.0))
-    LOGGER.info("Mean budget penalty                : %.4f", summary.get("budget_penalty", 0.0))
-    LOGGER.info("Mean entropy penalty               : %.4f", summary.get("entropy_penalty", 0.0))
-    LOGGER.info("Mean final new item count          : %.4f", summary.get("final_new_item_count", 0.0))
-    LOGGER.info("Mean final seller count            : %.4f", summary.get("final_seller_count", 0.0))
+    LOGGER.info("Average local-search moves         : %.4f", summary.get("local_search_moves", 0.0))
     LOGGER.info("Candidate shortage rate            : %.4f", summary.get("candidate_shortage", 0.0))
+    LOGGER.info("Raw/final item overlap             : %.4f", summary.get("raw_final_overlap_rate", 0.0))
+    LOGGER.info("Average changed item count         : %.4f", summary.get("changed_item_count", 0.0))
+    LOGGER.info("Final DCG-weighted utility         : %.4f", summary.get("final_utility", 0.0))
     LOGGER.info("%s\n", "=" * 78)
 
 
@@ -1539,7 +1796,7 @@ def main() -> None:
 
     if any(strategy in BPR_STRATEGIES for strategy in strategies):
         try:
-            ensure_implicit_available(required=True, require_bpr=True)
+            ensure_torch_available(required=True)
         except RuntimeError as exc:
             LOGGER.error("%s", exc)
             sys.exit(1)
@@ -1586,6 +1843,9 @@ def main() -> None:
             regularization=args.bpr_regularization,
             seed=args.seed,
             show_progress=args.show_progress,
+            batch_size=args.bpr_batch_size,
+            optimizer_name=args.bpr_optimizer,
+            negative_sampler=args.bpr_negative_sampler,
         )
         recall_models["bpr"] = bpr_model
         model_diagnostics["bpr"] = bpr_diagnostics

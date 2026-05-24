@@ -278,24 +278,20 @@ class AdaptiveConstraintHandler(ConstraintHandler):
 
 @dataclass
 class EcommerceConstraintConfig:
-    """场景一电商软硬约束配置。"""
-    alpha_inv: float = 0.05  # 库存机会约束允许的最大缺货风险
-    required_new_count: int = 2  # 推荐列表中的新品数量底线
-    min_sellers: int = 3  # 推荐列表中最少不同供应商数量
-    target_entropy_threshold: float = 1.5  # 品牌曝光熵最低目标
-    lambda_budget: float = 1.0  # 预算软约束拉格朗日乘子
-    lambda_entropy: float = 1.0  # 熵软约束拉格朗日乘子
-    rho_budget: float = 1.0  # 预算软约束二次惩罚系数
-    rho_entropy: float = 1.0  # 熵软约束二次惩罚系数
+    """场景一电商库存容量硬约束配置。"""
+
+    capacity_col: str = "inventory_initial"
 
 
 class EcommerceConstraintHandler:
     """
-    场景一（电商环境）软硬约束处理器。
+    场景一（电商环境）库存容量硬约束处理器。
 
-    该类独立于现有 ConstraintHandler，不改变当前 DualAgent-Rec 的实验口径。
-    输入候选集可以是 pandas DataFrame，也可以是记录字典列表；内部统一转成
-    DataFrame 后用 pandas/numpy 向量化计算。
+    推荐矩阵上的唯一约束是全局库存容量：
+        sum_u 1(item_i in R_u) <= inventory_initial_i
+
+    输入可以是 pandas DataFrame，也可以是记录字典列表；内部统一转成
+    DataFrame 后计算 item-level exposure 与 capacity overflow。
     """
 
     def __init__(self, config: Optional[EcommerceConstraintConfig] = None):
@@ -317,235 +313,83 @@ class EcommerceConstraintHandler:
         if missing:
             raise ValueError(f"{method_name} requires columns: {missing}")
 
-    @staticmethod
-    def _resolve_budget_info(user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]]) -> Optional[Dict[str, float]]:
-        """标准化用户预算输入；None 表示本次不评估预算软约束。"""
-        if user_budget_info is None:
-            return None
-        if isinstance(user_budget_info, pd.Series):
-            data = user_budget_info.to_dict()
-        elif isinstance(user_budget_info, Mapping):
-            data = dict(user_budget_info)
-        else:
-            raise TypeError("user_budget_info must be a dict, pandas Series, or None.")
+    def capacity_diagnostics(
+        self,
+        recommendations: Union[pd.DataFrame, List[Dict[str, Any]]],
+        capacity_col: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        评估全局库存容量约束。
 
-        missing = [key for key in ("target_budget", "budget_tolerance") if key not in data]
-        if missing:
-            raise ValueError(f"user_budget_info missing required keys: {missing}")
+        capacity_satisfaction_rate 以被曝光商品为分母，衡量有多少被曝光商品
+        没有超过库存容量。未曝光商品不进入该分母。
+        """
+        df = self._to_dataframe(recommendations)
+        if df.empty:
+            return {
+                "capacity_satisfied": True,
+                "capacity_violation_total": 0.0,
+                "over_capacity_item_count": 0,
+                "max_capacity_overflow": 0.0,
+                "capacity_satisfaction_rate": 1.0,
+                "mean_item_utilization": 0.0,
+                "exposure_by_item": pd.DataFrame(
+                    columns=["item_id", "capacity_max", "exposure_count", "overflow"]
+                ),
+            }
 
-        target_budget = float(data["target_budget"])
-        budget_tolerance = float(data["budget_tolerance"])
-        if not np.isfinite(target_budget) or not np.isfinite(budget_tolerance):
-            raise ValueError("target_budget and budget_tolerance must be finite numbers.")
+        col = self.config.capacity_col if capacity_col is None else str(capacity_col)
+        self._require_columns(df, ["item_id", col], "capacity_diagnostics")
+
+        work = df[["item_id", col]].copy()
+        work["item_id"] = work["item_id"].astype(str)
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+        exposure = work["item_id"].value_counts().rename("exposure_count").astype(float)
+        capacity = (
+            work.drop_duplicates("item_id", keep="first")
+            .set_index("item_id")[col]
+            .rename("capacity_max")
+            .astype(float)
+        )
+        joined = capacity.to_frame().join(exposure, how="right")
+        joined["capacity_max"] = joined["capacity_max"].fillna(0.0).clip(lower=0.0)
+        joined["exposure_count"] = joined["exposure_count"].fillna(0.0)
+        joined["overflow"] = (joined["exposure_count"] - joined["capacity_max"]).clip(lower=0.0)
+
+        safe_capacity = joined["capacity_max"].replace(0.0, np.nan)
+        utilization = (joined["exposure_count"] / safe_capacity).replace([np.inf, -np.inf], np.nan)
+        finite_utilization = utilization.dropna()
+
+        violation_total = float(joined["overflow"].sum())
+        over_count = int((joined["overflow"] > 0.0).sum())
+        exposed_count = max(1, len(joined))
+        satisfaction_rate = float((joined["overflow"] <= 0.0).sum() / exposed_count)
+
         return {
-            "target_budget": target_budget,
-            "budget_tolerance": max(0.0, budget_tolerance),
+            "capacity_satisfied": bool(violation_total <= 0.0),
+            "capacity_violation_total": violation_total,
+            "over_capacity_item_count": over_count,
+            "max_capacity_overflow": float(joined["overflow"].max()) if len(joined) else 0.0,
+            "capacity_satisfaction_rate": satisfaction_rate,
+            "mean_item_utilization": float(finite_utilization.mean()) if not finite_utilization.empty else 0.0,
+            "exposure_by_item": joined.reset_index()[["item_id", "capacity_max", "exposure_count", "overflow"]],
         }
-
-    def check_inventory(
-        self,
-        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
-        alpha_inv: Optional[float] = None,
-    ) -> pd.DataFrame:
-        """
-        动态库存机会约束：P(未来有货) >= 1 - alpha_inv。
-
-        程序化转化为：保留 stockout_risk <= alpha_inv 的商品。
-        """
-        df = self._to_dataframe(candidate_items)
-        if df.empty:
-            return df
-
-        self._require_columns(df, ["stockout_risk"], "check_inventory")
-        threshold = self.config.alpha_inv if alpha_inv is None else float(alpha_inv)
-        risks = pd.to_numeric(df["stockout_risk"], errors="coerce")
-        return df.loc[risks <= threshold].copy()
-
-    def check_new_item_floor(
-        self,
-        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
-        required_new_count: Optional[int] = None,
-    ) -> bool:
-        """
-        新品扶持底线：sum(I(item in new_items)) >= required_new_count。
-        """
-        df = self._to_dataframe(candidate_items)
-        if df.empty:
-            return False
-
-        self._require_columns(df, ["is_new"], "check_new_item_floor")
-        required = self.config.required_new_count if required_new_count is None else int(required_new_count)
-        new_count = int(df["is_new"].fillna(False).astype(bool).sum())
-        return new_count >= required
-
-    def check_seller_diversity(
-        self,
-        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
-        min_sellers: Optional[int] = None,
-    ) -> bool:
-        """
-        多供应商反垄断约束：|{seller_id(item)}| >= min_sellers。
-        """
-        df = self._to_dataframe(candidate_items)
-        if df.empty:
-            return False
-
-        self._require_columns(df, ["seller_id"], "check_seller_diversity")
-        required = self.config.min_sellers if min_sellers is None else int(min_sellers)
-        seller_count = int(df["seller_id"].dropna().nunique())
-        return seller_count >= required
-
-    def calc_budget_penalty(
-        self,
-        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
-        user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]],
-    ) -> float:
-        """
-        价格与预算偏离惩罚：
-        mean(max(0, abs(price_filled - target_budget) - budget_tolerance))。
-        """
-        budget_info = self._resolve_budget_info(user_budget_info)
-        if budget_info is None:
-            return 0.0
-
-        df = self._to_dataframe(candidate_items)
-        if df.empty:
-            return 0.0
-
-        self._require_columns(df, ["price_filled"], "calc_budget_penalty")
-        prices = pd.to_numeric(df["price_filled"], errors="coerce").to_numpy(dtype=float)
-        valid_prices = prices[np.isfinite(prices)]
-        if valid_prices.size == 0:
-            return 0.0
-
-        deviations = np.abs(valid_prices - budget_info["target_budget"])
-        penalties = np.maximum(0.0, deviations - budget_info["budget_tolerance"])
-        return float(np.mean(penalties))
-
-    def calc_entropy_penalty(
-        self,
-        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
-        target_entropy_threshold: Optional[float] = None,
-    ) -> float:
-        """
-        供给侧曝光信息熵惩罚：
-        max(0, H_target - (-sum(q_v * log(q_v))))。
-        """
-        df = self._to_dataframe(candidate_items)
-        if df.empty:
-            return 0.0
-
-        self._require_columns(df, ["brand_id"], "calc_entropy_penalty")
-        threshold = (
-            self.config.target_entropy_threshold
-            if target_entropy_threshold is None
-            else float(target_entropy_threshold)
-        )
-
-        brand_probs = df["brand_id"].dropna().value_counts(normalize=True).to_numpy(dtype=float)
-        if brand_probs.size == 0:
-            entropy = 0.0
-        else:
-            # value_counts 不会产生 0 概率；仍保留过滤以对应公式里的 0 log 0 处理。
-            brand_probs = brand_probs[brand_probs > 0]
-            entropy = float(-np.sum(brand_probs * np.log(brand_probs)))
-        return float(max(0.0, threshold - entropy))
-
-    def calc_augmented_lagrangian_penalty(
-        self,
-        budget_penalty: float,
-        entropy_penalty: float,
-        lambda_budget: Optional[float] = None,
-        lambda_entropy: Optional[float] = None,
-        rho_budget: Optional[float] = None,
-        rho_entropy: Optional[float] = None,
-    ) -> float:
-        """
-        增广拉格朗日软约束总惩罚：
-        lambda * phi + rho / 2 * phi^2。
-        """
-        lb = self.config.lambda_budget if lambda_budget is None else float(lambda_budget)
-        le = self.config.lambda_entropy if lambda_entropy is None else float(lambda_entropy)
-        rb = self.config.rho_budget if rho_budget is None else float(rho_budget)
-        re = self.config.rho_entropy if rho_entropy is None else float(rho_entropy)
-
-        budget_phi = max(0.0, float(budget_penalty))
-        entropy_phi = max(0.0, float(entropy_penalty))
-        total = (
-            lb * budget_phi
-            + 0.5 * rb * budget_phi ** 2
-            + le * entropy_phi
-            + 0.5 * re * entropy_phi ** 2
-        )
-        return float(total)
 
     def evaluate_all(
         self,
-        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
-        user_budget_info: Optional[Union[Mapping[str, Any], pd.Series]] = None,
-        alpha_inv: Optional[float] = None,
-        required_new_count: Optional[int] = None,
-        min_sellers: Optional[int] = None,
-        target_entropy_threshold: Optional[float] = None,
+        recommendations: Union[pd.DataFrame, List[Dict[str, Any]]],
+        capacity_col: Optional[str] = None,
+        **_: Any,
     ) -> Dict[str, Any]:
         """
-        统筹评估入口：一次性返回所有硬约束检查结果和软约束惩罚。
+        统筹评估入口：一次性返回库存容量硬约束检查结果。
+
+        **_ 用于兼容旧调用签名；场景一新实验不再评估预算、新品、
+        供应商或 stockout 机会约束。
         """
-        df = self._to_dataframe(candidate_items)
-        total_count = len(df)
-
-        inventory_feasible_items = self.check_inventory(df, alpha_inv=alpha_inv)
-        inventory_feasible_count = len(inventory_feasible_items)
-        inventory_pass_rate = inventory_feasible_count / total_count if total_count else 0.0
-
-        new_item_satisfied = self.check_new_item_floor(
-            df,
-            required_new_count=required_new_count,
-        )
-        seller_satisfied = self.check_seller_diversity(
-            df,
-            min_sellers=min_sellers,
-        )
-
-        new_item_count = (
-            int(df["is_new"].fillna(False).astype(bool).sum())
-            if "is_new" in df.columns and total_count
-            else 0
-        )
-        seller_count = (
-            int(df["seller_id"].dropna().nunique())
-            if "seller_id" in df.columns and total_count
-            else 0
-        )
-
-        budget_evaluated = user_budget_info is not None
-        budget_penalty = self.calc_budget_penalty(df, user_budget_info)
-        entropy_penalty = self.calc_entropy_penalty(
-            df,
-            target_entropy_threshold=target_entropy_threshold,
-        )
-        augmented_penalty = self.calc_augmented_lagrangian_penalty(
-            budget_penalty=budget_penalty,
-            entropy_penalty=entropy_penalty,
-        )
-
-        inventory_satisfied = total_count > 0 and inventory_feasible_count == total_count
-        all_hard_satisfied = bool(
-            inventory_satisfied and new_item_satisfied and seller_satisfied
-        )
-
-        return {
-            "inventory_feasible_items": inventory_feasible_items,
-            "inventory_feasible_count": inventory_feasible_count,
-            "inventory_pass_rate": float(inventory_pass_rate),
-            "inventory_satisfied": bool(inventory_satisfied),
-            "new_item_count": new_item_count,
-            "new_item_floor_satisfied": bool(new_item_satisfied),
-            "seller_count": seller_count,
-            "seller_diversity_satisfied": bool(seller_satisfied),
-            "budget_evaluated": bool(budget_evaluated),
-            "budget_penalty": float(budget_penalty),
-            "entropy_penalty": float(entropy_penalty),
-            "augmented_lagrangian_penalty": float(augmented_penalty),
-            "all_hard_constraints_satisfied": all_hard_satisfied,
-        }
+        diagnostics = self.capacity_diagnostics(recommendations, capacity_col=capacity_col)
+        compact = dict(diagnostics)
+        compact.pop("exposure_by_item", None)
+        compact["all_hard_constraints_satisfied"] = bool(compact.get("capacity_satisfied", False))
+        return compact
