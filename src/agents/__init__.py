@@ -15,11 +15,11 @@ from .baseline_agents import (
     InProcessingConfig,
     WeightedSumInProcessingBaseline,
 )
-from .recruiting_baseline_agents import (
-    RecruitingInProcessingAgent,
-    RecruitingInProcessingConfig,
-    RecruitingPostProcessingAgent,
-    RecruitingPostProcessingConfig,
+from .news_baseline_agents import (
+    NewsInProcessingAgent,
+    NewsInProcessingConfig,
+    NewsPostProcessingAgent,
+    NewsPostProcessingConfig,
 )
 
 __all__ = [
@@ -35,8 +35,8 @@ __all__ = [
     'WeightedSumInProcessingBaseline',
     'GreedyRerankConfig',
     'GreedyRerankingBaseline',
-    'RecruitingInProcessingAgent',
-    'RecruitingInProcessingConfig',
-    'RecruitingPostProcessingAgent',
-    'RecruitingPostProcessingConfig',
+    'NewsInProcessingAgent',
+    'NewsInProcessingConfig',
+    'NewsPostProcessingAgent',
+    'NewsPostProcessingConfig',
 ]
