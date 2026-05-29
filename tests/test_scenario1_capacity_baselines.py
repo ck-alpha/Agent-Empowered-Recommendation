@@ -13,6 +13,13 @@ from agents import (  # noqa: E402
     EcommercePostProcessingConfig,
 )
 from constraints import EcommerceConstraintConfig, EcommerceConstraintHandler  # noqa: E402
+from run_scenario1_baselines import (  # noqa: E402
+    build_id_mappings,
+    iterative_k_core_filter,
+    make_data_stat,
+    sample_test_users,
+    temporal_train_test_split,
+)
 
 
 def test_capacity_diagnostics_counts_overflow() -> None:
@@ -108,3 +115,83 @@ def test_inprocessing_dual_price_can_reduce_capacity_conflict_without_repair() -
     assert in_pairs == {("u1", "B"), ("u2", "A")}
     assert in_result["diagnostics"]["final_constraints"]["capacity_satisfied"] is True
     assert in_result["diagnostics"]["dual_nonzero_price_count"] == 1
+
+
+def test_iterative_k_core_filters_users_and_items_until_stable() -> None:
+    rows = []
+    timestamp = 0
+    core_users = [f"u{i}" for i in range(6)]
+    core_items = [f"i{i}" for i in range(6)]
+    for user_id in core_users:
+        for item_id in core_items:
+            rows.append({"user_id": user_id, "item_id": item_id, "timestamp": timestamp})
+            timestamp += 1
+
+    for item_id in core_items[:5] + ["rare"]:
+        rows.append({"user_id": "u_bridge", "item_id": item_id, "timestamp": timestamp})
+        timestamp += 1
+
+    interactions = pd.DataFrame(rows)
+
+    filtered, stats = iterative_k_core_filter(
+        interactions,
+        min_user_interactions=6,
+        min_item_interactions=6,
+    )
+
+    assert set(filtered["user_id"]) == set(core_users)
+    assert "rare" not in set(filtered["item_id"])
+    assert int(filtered["user_id"].value_counts().min()) >= 6
+    assert int(filtered["item_id"].value_counts().min()) >= 6
+    assert [row["step"] for row in stats][-1] == "final_filtered"
+    assert len([row for row in stats if str(row["step"]).startswith("kcore_iter_")]) >= 2
+
+
+def test_sample_test_users_zero_keeps_all_eligible_users() -> None:
+    interactions = pd.DataFrame(
+        [
+            {"user_id": "u1", "item_id": "A", "timestamp": 1},
+            {"user_id": "u1", "item_id": "B", "timestamp": 2},
+            {"user_id": "u2", "item_id": "A", "timestamp": 1},
+            {"user_id": "u2", "item_id": "C", "timestamp": 2},
+            {"user_id": "u3", "item_id": "D", "timestamp": 1},
+            {"user_id": "u3", "item_id": "A", "timestamp": 2},
+        ]
+    )
+    train_df, test_df = temporal_train_test_split(interactions, min_user_interactions=2)
+    mappings = build_id_mappings(train_df)
+
+    sampled = sample_test_users(test_df, mappings, test_users=0, seed=42)
+
+    assert len(sampled) == len(test_df)
+    assert sampled["user_id"].tolist() == test_df["user_id"].tolist()
+
+
+def test_data_stats_records_split_coverage_and_sampling_rate() -> None:
+    interactions = pd.DataFrame(
+        [
+            {"user_id": "u1", "item_id": "A", "timestamp": 1},
+            {"user_id": "u1", "item_id": "B", "timestamp": 2},
+            {"user_id": "u2", "item_id": "A", "timestamp": 1},
+            {"user_id": "u2", "item_id": "C", "timestamp": 2},
+        ]
+    )
+    train_df, test_df = temporal_train_test_split(interactions, min_user_interactions=2)
+
+    stat = make_data_stat(
+        "train_test_split",
+        interactions,
+        min_user_interactions=2,
+        min_item_interactions=1,
+        train_df=train_df,
+        test_df=test_df,
+        sampled_test=test_df,
+    )
+
+    assert stat["train_interactions"] == 2
+    assert stat["test_users"] == 2
+    assert stat["evaluated_users"] == 2
+    assert stat["test_user_sampling_rate"] == 1.0
+    assert stat["test_only_item_count"] == 2
+    assert stat["cold_start_unrecallable_rate"] == 1.0
+    assert stat["train_item_coverage_rate"] == 0.0

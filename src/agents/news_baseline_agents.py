@@ -342,6 +342,44 @@ class NewsInProcessingAgent(_NewsBase):
         penalty = float(constraints.get("augmented_lagrangian_penalty", 0.0))
         return float(utility - penalty), float(utility), float(constraints.get("topic_entropy", 0.0))
 
+    def _topic_payloads(self, groups: Mapping[str, pd.DataFrame], k: int) -> Dict[str, Dict[str, Any]]:
+        payloads: Dict[str, Dict[str, Any]] = {}
+        for topic, group in groups.items():
+            trimmed = group.head(k)
+            payloads[str(topic)] = {
+                "scores": pd.to_numeric(trimmed[self.base_score_col], errors="coerce").fillna(0.0).to_numpy(dtype=float),
+                "ids": trimmed["news_id"].astype(str).tolist(),
+            }
+        return payloads
+
+    def _allocation_objective_fast(
+        self,
+        payloads: Mapping[str, Mapping[str, Any]],
+        allocation: Mapping[str, int],
+        weights: np.ndarray,
+        weight_norm: float,
+        k: int,
+    ) -> Tuple[float, float, float, str]:
+        selected: List[Tuple[float, str]] = []
+        counts: Dict[str, int] = {}
+        for topic, count in allocation.items():
+            count = int(count)
+            if count <= 0:
+                continue
+            payload = payloads[str(topic)]
+            scores = payload["scores"]
+            ids = payload["ids"]
+            for idx in range(count):
+                selected.append((float(scores[idx]), str(ids[idx])))
+            counts[str(topic)] = count
+        selected.sort(key=lambda item: (-item[0], item[1]))
+        utility = float(sum(score * float(weights[idx]) for idx, (score, _) in enumerate(selected)) / weight_norm)
+        entropy = NewsConstraintHandler.entropy_from_counts(counts, k)
+        diversity_penalty = self.constraint_handler.diversity_penalty_from_entropy(entropy)
+        penalty = self.constraint_handler.augmented_lagrangian_penalty(diversity_penalty)
+        signature = _stable_signature(item_id for _, item_id in selected)
+        return float(utility - penalty), utility, float(entropy), signature
+
     def recommend(
         self,
         user_id: str,
@@ -356,26 +394,28 @@ class NewsInProcessingAgent(_NewsBase):
         k = min(requested_k, len(prepared))
         raw_reference = _with_rank(prepared.head(k).copy())
         groups = self._topic_groups(prepared, k)
+        payloads = self._topic_payloads(groups, k)
         topics = sorted(groups)
         caps = {topic: int(min(k, len(group))) for topic, group in groups.items()}
+        weights = _position_weights(k)
+        weight_norm = max(float(np.sum(weights)), 1e-9)
         best_slate: Optional[pd.DataFrame] = None
         best_allocation: Dict[str, int] = {}
         best_key: Optional[Tuple[float, float, float, str]] = None
         search_steps = 0
 
         for allocation in self._enumerate_allocations(topics, caps, k):
-            slate = self._slate_from_allocation(groups, allocation)
-            if len(slate) != k:
-                continue
-            objective, utility, entropy = self._allocation_objective(slate)
-            signature = _stable_signature(slate["news_id"].astype(str).tolist())
+            objective, utility, entropy, signature = self._allocation_objective_fast(
+                payloads, allocation, weights, weight_norm, k
+            )
             key = (objective, utility, entropy, tuple(-ord(ch) for ch in signature))
             search_steps += 1
             if best_key is None or key > best_key:
                 best_key = key
-                best_slate = slate
                 best_allocation = dict(allocation)
 
+        if best_allocation:
+            best_slate = self._slate_from_allocation(groups, best_allocation)
         recommendations = best_slate if best_slate is not None else raw_reference
         recommendations = _with_rank(recommendations.reset_index(drop=True))
         item_ids = recommendations["news_id"].astype(str).tolist()

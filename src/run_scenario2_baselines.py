@@ -619,13 +619,6 @@ def iter_eval_frames(dev_pairs_path: Path, max_eval_impressions: int, batch_size
             return
         yield carryover.reset_index(drop=True)
 
-    if not carryover.empty:
-        for _, group in carryover.groupby("impression_id", sort=False):
-            if max_eval_impressions and max_eval_impressions > 0 and yielded >= max_eval_impressions:
-                return
-            yielded += 1
-            yield group.reset_index(drop=True)
-
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

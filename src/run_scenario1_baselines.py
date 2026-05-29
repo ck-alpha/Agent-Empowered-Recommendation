@@ -8,7 +8,8 @@ Recommended recall-only smoke command:
 
 Recommended recall-only full command:
 /home/username/conda/envs/dualagent/bin/python src/run_scenario1_baselines.py \
-  --recall_only --recall_strategy all --test_users 100000 --recall_k 200 \
+  --recall_only --recall_strategy all --test_users 0 --recall_k 200 \
+  --min_user_interactions 6 --min_item_interactions 6 \
   --output_json results/scenario1_metrics_recall_suite_full.json
 
 This script evaluates a rigorous recommendation funnel:
@@ -173,7 +174,12 @@ def parse_args() -> argparse.Namespace:
         default="results/scenario1_metrics_recall_suite.json",
         help="Path to save detailed metrics JSON.",
     )
-    parser.add_argument("--test_users", type=int, default=1000, help="Maximum number of eligible users to evaluate.")
+    parser.add_argument(
+        "--test_users",
+        type=int,
+        default=1000,
+        help="Maximum number of eligible users to evaluate. Use 0 for all eligible users.",
+    )
     parser.add_argument("--recall_k", type=int, default=200, help="Recall size before reranking.")
     parser.add_argument("--top_k", type=int, default=10, help="Final recommendation list length.")
     parser.add_argument("--factors", type=int, default=128, help="BPR latent factor dimension.")
@@ -201,7 +207,13 @@ def parse_args() -> argparse.Namespace:
         help="Item-KNN sparse weighting/similarity model.",
     )
     parser.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed for sampling, BPR, and random recall.")
-    parser.add_argument("--min_user_interactions", type=int, default=3, help="Minimum interactions before temporal split.")
+    parser.add_argument("--min_user_interactions", type=int, default=3, help="Minimum user interactions before temporal split.")
+    parser.add_argument(
+        "--min_item_interactions",
+        type=int,
+        default=1,
+        help="Minimum item interactions before temporal split. Use 6 to filter items with <=5 interactions.",
+    )
     parser.add_argument(
         "--recall_backend",
         choices=["legacy", "fast"],
@@ -302,6 +314,205 @@ def load_scenario1_tables(processed_dir: str, output_prefix: str) -> Tuple[pd.Da
     interactions["timestamp"] = pd.to_numeric(interactions["timestamp"], errors="coerce")
     interactions = interactions.dropna(subset=["timestamp"]).copy()
     return items, users, interactions
+
+
+def _density(rows: int, users: int, items: int) -> float:
+    denominator = users * items
+    return float(rows / denominator) if denominator else 0.0
+
+
+def _interaction_count_stats(counts: pd.Series, prefix: str) -> Dict[str, float]:
+    if counts.empty:
+        return {
+            f"{prefix}_min": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_median": 0.0,
+            f"{prefix}_p90": 0.0,
+            f"{prefix}_p95": 0.0,
+            f"{prefix}_max": 0.0,
+        }
+    counts = counts.astype(float)
+    return {
+        f"{prefix}_min": float(counts.min()),
+        f"{prefix}_mean": float(counts.mean()),
+        f"{prefix}_median": float(counts.median()),
+        f"{prefix}_p90": float(counts.quantile(0.90)),
+        f"{prefix}_p95": float(counts.quantile(0.95)),
+        f"{prefix}_max": float(counts.max()),
+    }
+
+
+def make_data_stat(
+    step: str,
+    interactions: pd.DataFrame,
+    *,
+    iteration: Optional[int] = None,
+    min_user_interactions: Optional[int] = None,
+    min_item_interactions: Optional[int] = None,
+    removed_interactions: int = 0,
+    removed_users: int = 0,
+    removed_items: int = 0,
+    train_df: Optional[pd.DataFrame] = None,
+    test_df: Optional[pd.DataFrame] = None,
+    sampled_test: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    """Build one row for the scenario-1 data filtering/split audit trail."""
+    rows = int(len(interactions))
+    users = int(interactions["user_id"].nunique()) if rows else 0
+    items = int(interactions["item_id"].nunique()) if rows else 0
+    user_counts = interactions.groupby("user_id").size() if rows else pd.Series(dtype=int)
+    item_counts = interactions.groupby("item_id").size() if rows else pd.Series(dtype=int)
+
+    out: Dict[str, Any] = {
+        "step": step,
+        "iteration": iteration,
+        "rows": rows,
+        "users": users,
+        "items": items,
+        "density": _density(rows, users, items),
+        "removed_interactions": int(removed_interactions),
+        "removed_users": int(removed_users),
+        "removed_items": int(removed_items),
+        "min_user_interactions": min_user_interactions,
+        "min_item_interactions": min_item_interactions,
+        "users_below_min_interactions": None,
+        "items_below_min_interactions": None,
+        "train_interactions": None,
+        "train_users": None,
+        "train_items": None,
+        "test_interactions": None,
+        "test_users": None,
+        "test_items": None,
+        "test_only_item_count": None,
+        "cold_start_unrecallable_rate": None,
+        "train_item_coverage_rate": None,
+        "evaluated_users": None,
+        "test_user_sampling_rate": None,
+    }
+    out.update(_interaction_count_stats(user_counts, "user_interactions"))
+    out.update(_interaction_count_stats(item_counts, "item_interactions"))
+
+    if min_user_interactions is not None:
+        out["users_below_min_interactions"] = int((user_counts < min_user_interactions).sum())
+    if min_item_interactions is not None:
+        out["items_below_min_interactions"] = int((item_counts < min_item_interactions).sum())
+
+    if train_df is not None:
+        train_items = set(train_df["item_id"].astype(str))
+        out["train_interactions"] = int(len(train_df))
+        out["train_users"] = int(train_df["user_id"].nunique()) if len(train_df) else 0
+        out["train_items"] = int(train_df["item_id"].nunique()) if len(train_df) else 0
+    else:
+        train_items = set()
+
+    if test_df is not None:
+        test_items = set(test_df["item_id"].astype(str))
+        out["test_interactions"] = int(len(test_df))
+        out["test_users"] = int(test_df["user_id"].nunique()) if len(test_df) else 0
+        out["test_items"] = int(test_df["item_id"].nunique()) if len(test_df) else 0
+        if train_df is not None and len(test_df):
+            covered = test_df["item_id"].astype(str).isin(train_items)
+            cold_start_rate = float((~covered).mean())
+            out["test_only_item_count"] = int(len(test_items - train_items))
+            out["cold_start_unrecallable_rate"] = cold_start_rate
+            out["train_item_coverage_rate"] = float(1.0 - cold_start_rate)
+
+    if sampled_test is not None:
+        evaluated_users = int(sampled_test["user_id"].nunique()) if len(sampled_test) else 0
+        eligible_users = int(out["test_users"] or 0)
+        out["evaluated_users"] = evaluated_users
+        out["test_user_sampling_rate"] = float(evaluated_users / eligible_users) if eligible_users else 0.0
+
+    return out
+
+
+def iterative_k_core_filter(
+    interactions: pd.DataFrame,
+    min_user_interactions: int,
+    min_item_interactions: int,
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """Iteratively remove users/items below the configured interaction thresholds."""
+    if min_user_interactions < 2:
+        raise ValueError("min_user_interactions must be >= 2 for temporal split.")
+    if min_item_interactions < 1:
+        raise ValueError("min_item_interactions must be >= 1.")
+
+    stats: List[Dict[str, Any]] = [
+        make_data_stat(
+            "loaded",
+            interactions,
+            min_user_interactions=min_user_interactions,
+            min_item_interactions=min_item_interactions,
+        )
+    ]
+    current = interactions.copy()
+    iteration = 0
+    while True:
+        iteration += 1
+        before_rows = len(current)
+        before_users = current["user_id"].nunique()
+        before_items = current["item_id"].nunique()
+
+        user_counts = current["user_id"].value_counts()
+        item_counts = current["item_id"].value_counts()
+        keep_users = set(user_counts[user_counts >= min_user_interactions].index.astype(str))
+        keep_items = set(item_counts[item_counts >= min_item_interactions].index.astype(str))
+        current = current[
+            current["user_id"].isin(keep_users) & current["item_id"].isin(keep_items)
+        ].copy()
+
+        removed_interactions = int(before_rows - len(current))
+        stats.append(
+            make_data_stat(
+                f"kcore_iter_{iteration}",
+                current,
+                iteration=iteration,
+                min_user_interactions=min_user_interactions,
+                min_item_interactions=min_item_interactions,
+                removed_interactions=removed_interactions,
+                removed_users=int(before_users - current["user_id"].nunique()),
+                removed_items=int(before_items - current["item_id"].nunique()),
+            )
+        )
+
+        if current.empty:
+            raise ValueError(
+                "Scenario-1 k-core filtering removed all interactions. "
+                f"min_user_interactions={min_user_interactions}, "
+                f"min_item_interactions={min_item_interactions}"
+            )
+        if removed_interactions == 0:
+            break
+
+    stats.append(
+        make_data_stat(
+            "final_filtered",
+            current,
+            min_user_interactions=min_user_interactions,
+            min_item_interactions=min_item_interactions,
+        )
+    )
+    return current.reset_index(drop=True), stats
+
+
+def trim_feature_tables_to_interactions(
+    items: pd.DataFrame,
+    users: pd.DataFrame,
+    interactions: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Keep item/user feature tables aligned with the filtered interaction universe."""
+    item_ids = set(interactions["item_id"].astype(str))
+    user_ids = set(interactions["user_id"].astype(str))
+    filtered_items = items[items["item_id"].isin(item_ids)].copy().reset_index(drop=True)
+    filtered_users = users[users["user_id"].isin(user_ids)].copy().reset_index(drop=True)
+    LOGGER.info(
+        "Trimmed feature tables: items %s -> %s, users %s -> %s",
+        len(items),
+        len(filtered_items),
+        len(users),
+        len(filtered_users),
+    )
+    return filtered_items, filtered_users
 
 
 def temporal_train_test_split(interactions: pd.DataFrame, min_user_interactions: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -1291,13 +1502,17 @@ def history_bucket(history_length: int) -> str:
 
 
 def sample_test_users(test_df: pd.DataFrame, mappings: IdMappings, test_users: int, seed: int) -> pd.DataFrame:
-    """Sample eligible test users that exist in the recall train user mapping."""
+    """Sample eligible test users that exist in train mappings; test_users=0 means all."""
+    if test_users < 0:
+        raise ValueError("test_users must be >= 0. Use 0 for all eligible users.")
     eligible = test_df[test_df["user_id"].isin(mappings.user_id_to_idx)].copy()
     if eligible.empty:
         raise ValueError("No test users are present in train mappings.")
 
-    n = min(test_users, len(eligible))
-    return eligible.sample(n=n, random_state=seed).reset_index(drop=True)
+    if test_users == 0 or test_users >= len(eligible):
+        return eligible.reset_index(drop=True)
+
+    return eligible.sample(n=test_users, random_state=seed).reset_index(drop=True)
 
 
 def build_raw_topk_recommendations(candidate_df: pd.DataFrame, top_k: int) -> pd.DataFrame:
@@ -1760,6 +1975,20 @@ def log_final_report(summary: Dict[str, Any], recall_k: int, top_k: int) -> None
     LOGGER.info("%s\n", "=" * 78)
 
 
+def data_stats_csv_path(output_json: str) -> Path:
+    output_path = Path(output_json)
+    return output_path.with_name(f"{output_path.stem}_data_stats.csv")
+
+
+def save_data_stats_csv(output_json: str, data_stats: Sequence[Mapping[str, Any]]) -> None:
+    if not data_stats:
+        return
+    path = data_stats_csv_path(output_json)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(list(data_stats)).to_csv(path, index=False)
+    LOGGER.info("Saved scenario-1 data stats CSV: %s", path)
+
+
 def save_metrics_json(
     output_json: str,
     args: argparse.Namespace,
@@ -1769,6 +1998,7 @@ def save_metrics_json(
     summaries_by_method_strategy: Optional[Dict[str, Dict[str, Any]]] = None,
     completed_strategies: Optional[Sequence[str]] = None,
     diagnostics: Optional[Dict[str, Any]] = None,
+    data_stats: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> None:
     """Persist per-user records and aggregate summary for plotting."""
     output_path = Path(output_json)
@@ -1780,11 +2010,14 @@ def save_metrics_json(
         "summaries_by_method_strategy": summaries_by_method_strategy or {},
         "completed_strategies": list(completed_strategies or summaries_by_strategy.keys()),
         "diagnostics": diagnostics or {},
+        "data_stats": list(data_stats or []),
         "records": [asdict(record) for record in records],
     }
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     LOGGER.info("Saved scenario-1 metrics JSON: %s", output_path)
+    if data_stats:
+        save_data_stats_csv(output_json, data_stats)
 
 
 def main() -> None:
@@ -1808,10 +2041,28 @@ def main() -> None:
             sys.exit(1)
 
     items, users, interactions = load_scenario1_tables(args.processed_dir, args.output_prefix)
+    interactions, data_stats = iterative_k_core_filter(
+        interactions,
+        min_user_interactions=args.min_user_interactions,
+        min_item_interactions=args.min_item_interactions,
+    )
+    items, users = trim_feature_tables_to_interactions(items, users, interactions)
     train_df, test_df = temporal_train_test_split(interactions, args.min_user_interactions)
     mappings = build_id_mappings(train_df)
     user_item_matrix = build_user_item_matrix(train_df, mappings)
     sampled_test = sample_test_users(test_df, mappings, args.test_users, args.seed)
+    data_stats.append(
+        make_data_stat(
+            "train_test_split",
+            interactions,
+            min_user_interactions=args.min_user_interactions,
+            min_item_interactions=args.min_item_interactions,
+            train_df=train_df,
+            test_df=test_df,
+            sampled_test=sampled_test,
+        )
+    )
+    save_data_stats_csv(args.output_json, data_stats)
     sampled_user_ids = set(sampled_test["user_id"].astype(str))
     popularity_scores = build_popularity_scores(train_df)
     train_by_user = build_train_history_by_user(train_df, sampled_user_ids)
@@ -1907,6 +2158,7 @@ def main() -> None:
                 summaries_by_method_strategy={},
                 completed_strategies=completed_strategies,
                 diagnostics=model_diagnostics,
+                data_stats=data_stats,
             )
 
         if len(strategies) == 1:
@@ -1930,6 +2182,7 @@ def main() -> None:
             summaries_by_method_strategy={},
             completed_strategies=completed_strategies,
             diagnostics=model_diagnostics,
+            data_stats=data_stats,
         )
         return
 
@@ -2002,6 +2255,7 @@ def main() -> None:
             summaries_by_strategy,
             summaries_by_method_strategy=summaries_by_method_strategy,
             completed_strategies=completed_strategies,
+            data_stats=data_stats,
         )
 
     if len(strategies) == 1:
@@ -2037,6 +2291,7 @@ def main() -> None:
         summaries_by_method_strategy=summaries_by_method_strategy,
         completed_strategies=completed_strategies,
         diagnostics=model_diagnostics,
+        data_stats=data_stats,
     )
 
 
