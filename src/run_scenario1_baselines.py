@@ -1515,7 +1515,12 @@ def sample_test_users(test_df: pd.DataFrame, mappings: IdMappings, test_users: i
     return eligible.sample(n=test_users, random_state=seed).reset_index(drop=True)
 
 
-def build_raw_topk_recommendations(candidate_df: pd.DataFrame, top_k: int) -> pd.DataFrame:
+def build_raw_topk_recommendations(
+    candidate_df: pd.DataFrame,
+    top_k: int,
+    *,
+    assume_sorted: bool = False,
+) -> pd.DataFrame:
     """Build unconstrained per-user Top-K recommendations before capacity handling."""
     if candidate_df.empty or top_k <= 0:
         out = candidate_df.head(0).copy()
@@ -1525,10 +1530,34 @@ def build_raw_topk_recommendations(candidate_df: pd.DataFrame, top_k: int) -> pd
     missing = [col for col in required if col not in candidate_df.columns]
     if missing:
         raise ValueError(f"candidate_df missing columns for raw Top-K: {missing}")
-    ranked = candidate_df.sort_values(["user_id", "base_score", "item_id"], ascending=[True, False, True]).copy()
+    if assume_sorted:
+        ranked = candidate_df.copy()
+    else:
+        ranked = candidate_df.sort_values(["user_id", "base_score", "item_id"], ascending=[True, False, True]).copy()
     raw = ranked.groupby("user_id", sort=False).head(top_k).copy()
-    raw["rank"] = raw.groupby("user_id").cumcount() + 1
+    raw["rank"] = raw.groupby("user_id", sort=False).cumcount() + 1
     return raw.reset_index(drop=True)
+
+
+def build_item_ids_by_user(recommendations: pd.DataFrame) -> Dict[str, List[str]]:
+    """Build a ranked user -> item-id list index for repeated metric lookups."""
+    if recommendations.empty or "user_id" not in recommendations.columns or "item_id" not in recommendations.columns:
+        return {}
+
+    ranked = recommendations.copy()
+    ranked["user_id"] = ranked["user_id"].astype(str)
+    ranked["item_id"] = ranked["item_id"].astype(str)
+    if "rank" in ranked.columns:
+        ranked["_rank_for_group"] = pd.to_numeric(ranked["rank"], errors="coerce").fillna(float("inf"))
+        ranked = ranked.sort_values(["user_id", "_rank_for_group", "item_id"], ascending=[True, True, True])
+        ranked = ranked.drop(columns=["_rank_for_group"])
+    elif "base_score" in ranked.columns:
+        ranked["_score_for_group"] = pd.to_numeric(ranked["base_score"], errors="coerce").fillna(0.0)
+        ranked = ranked.sort_values(["user_id", "_score_for_group", "item_id"], ascending=[True, False, True])
+        ranked = ranked.drop(columns=["_score_for_group"])
+    else:
+        ranked = ranked.sort_values(["user_id", "item_id"], ascending=[True, True])
+    return ranked.groupby("user_id", sort=False)["item_id"].agg(list).to_dict()
 
 
 def item_ids_for_user(recommendations: pd.DataFrame, user_id: str) -> List[str]:
@@ -1641,7 +1670,8 @@ def run_reranking_evaluation(
 
     all_candidates = pd.concat(candidate_frames, ignore_index=True)
     user_order = [row["user_id"] for row in user_rows]
-    raw_recs = build_raw_topk_recommendations(all_candidates, top_k=top_k)
+    raw_recs = build_raw_topk_recommendations(all_candidates, top_k=top_k, assume_sorted=True)
+    raw_items_by_user = build_item_ids_by_user(raw_recs)
     raw_constraints = evaluate_capacity_constraints(raw_recs)
     raw_capacity_rate = float(raw_constraints.get("capacity_satisfaction_rate", 0.0))
     raw_capacity_violation = float(raw_constraints.get("capacity_violation_total", 0.0))
@@ -1650,7 +1680,7 @@ def run_reranking_evaluation(
 
     raw_accuracy: Dict[str, Tuple[float, float]] = {}
     for info in user_rows:
-        raw_items = item_ids_for_user(raw_recs, info["user_id"])
+        raw_items = raw_items_by_user.get(info["user_id"], [])
         raw_accuracy[info["user_id"]] = compute_hr_ndcg_at_k(raw_items, info["ground_truth"], top_k)
 
     for method in selected_methods:
@@ -1668,6 +1698,7 @@ def run_reranking_evaluation(
         agent_over_capacity_count = int(final_constraints.get("over_capacity_item_count", 0))
         agent_max_overflow = float(final_constraints.get("max_capacity_overflow", 0.0))
         agent_mean_utilization = float(final_constraints.get("mean_item_utilization", 0.0))
+        final_items_by_user = build_item_ids_by_user(recommendations)
 
         final_counts = (
             recommendations["user_id"].astype(str).value_counts().astype(int).to_dict()
@@ -1678,10 +1709,10 @@ def run_reranking_evaluation(
         for info in user_rows:
             user_id = info["user_id"]
             ground_truth = info["ground_truth"]
-            final_items = item_ids_for_user(recommendations, user_id)
+            final_items = final_items_by_user.get(user_id, [])
             final_hr, final_ndcg = compute_hr_ndcg_at_k(final_items, ground_truth, top_k)
             raw_hr, raw_ndcg = raw_accuracy.get(user_id, (0.0, 0.0))
-            raw_items = item_ids_for_user(raw_recs, user_id)
+            raw_items = raw_items_by_user.get(user_id, [])
             raw_item_set = set(raw_items)
             final_item_set = set(final_items)
             overlap_count = len(raw_item_set & final_item_set)

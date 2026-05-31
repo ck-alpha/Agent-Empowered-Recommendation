@@ -503,15 +503,12 @@ class _EcommerceCapacityBase:
     def _initial_topk(self, candidates: pd.DataFrame, user_ids: Sequence[str]) -> pd.DataFrame:
         if candidates.empty or self.top_k <= 0:
             return candidates.head(0).copy()
-        selected: List[pd.DataFrame] = []
-        for user_id in user_ids:
-            group = candidates.loc[candidates["user_id"] == str(user_id)]
-            if group.empty:
-                continue
-            selected.append(group.head(self.top_k))
-        if not selected:
+        user_set = {str(user_id) for user_id in user_ids}
+        source = candidates.loc[candidates["user_id"].isin(user_set)].copy()
+        if source.empty:
             return candidates.head(0).copy()
-        return self._rerank(pd.concat(selected, ignore_index=True))
+        selected = source.groupby("user_id", sort=False, group_keys=False).head(self.top_k)
+        return self._rerank(selected.reset_index(drop=True))
 
     def _find_replacement(
         self,
@@ -520,8 +517,12 @@ class _EcommerceCapacityBase:
         current_recs: pd.DataFrame,
         exposure: Mapping[str, int],
         capacity: Mapping[str, int],
+        candidate_groups: Optional[Mapping[str, pd.DataFrame]] = None,
     ) -> Optional[pd.Series]:
-        pool = candidates.loc[candidates["user_id"] == str(user_id)].copy()
+        if candidate_groups is not None:
+            pool = candidate_groups.get(str(user_id), candidates.head(0)).copy()
+        else:
+            pool = candidates.loc[candidates["user_id"] == str(user_id)].copy()
         if pool.empty:
             return None
         current_items = set(
@@ -611,6 +612,112 @@ class EcommercePostProcessingAgent(_EcommerceCapacityBase):
         self.config = config or EcommercePostProcessingConfig()
         super().__init__(self.config.top_k, self.config.base_score_col, self.config.capacity_col)
 
+    def _selected_state(
+        self,
+        recs: pd.DataFrame,
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, set], Dict[str, set], Dict[str, int]]:
+        """Build mutable recommendation state for incremental capacity repair."""
+        selected_by_user: Dict[str, List[Dict[str, Any]]] = {}
+        selected_items_by_user: Dict[str, set] = {}
+        item_to_users: Dict[str, set] = {}
+        exposure: Dict[str, int] = {}
+        if recs.empty:
+            return selected_by_user, selected_items_by_user, item_to_users, exposure
+
+        for user_id, group in recs.groupby("user_id", sort=False):
+            user_key = str(user_id)
+            ordered = group.sort_values(
+                [self.base_score_col, "item_id"],
+                ascending=[False, True],
+            )
+            rows = [row.to_dict() for _, row in ordered.iterrows()]
+            selected_by_user[user_key] = rows
+            item_ids = {str(row["item_id"]) for row in rows}
+            selected_items_by_user[user_key] = item_ids
+            for item_id in item_ids:
+                exposure[item_id] = int(exposure.get(item_id, 0)) + 1
+                item_to_users.setdefault(item_id, set()).add(user_key)
+        return selected_by_user, selected_items_by_user, item_to_users, exposure
+
+    def _state_to_dataframe(
+        self,
+        selected_by_user: Mapping[str, List[Dict[str, Any]]],
+        users: Sequence[str],
+        candidates: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Materialize mutable recommendation state back into a ranked DataFrame."""
+        columns = list(candidates.columns)
+        if "rank" not in columns:
+            columns.append("rank")
+        rows: List[Dict[str, Any]] = []
+        for user_id in users:
+            user_key = str(user_id)
+            user_rows = sorted(
+                selected_by_user.get(user_key, []),
+                key=lambda row: (-float(row.get(self.base_score_col, 0.0)), str(row.get("item_id", ""))),
+            )
+            for rank, row in enumerate(user_rows[: self.top_k], start=1):
+                out = dict(row)
+                out["user_id"] = user_key
+                out["item_id"] = str(out["item_id"])
+                out["rank"] = int(rank)
+                rows.append(out)
+        if not rows:
+            out = candidates.head(0).copy()
+            out["rank"] = pd.Series(dtype=int)
+            return out.reindex(columns=columns)
+        return pd.DataFrame(rows).reindex(columns=columns).reset_index(drop=True)
+
+    def _removal_choice(
+        self,
+        over_item: str,
+        selected_by_user: Mapping[str, List[Dict[str, Any]]],
+        item_to_users: Mapping[str, set],
+    ) -> Optional[Tuple[str, int, Dict[str, Any]]]:
+        """Choose the lowest-utility exposure for one over-capacity item."""
+        best: Optional[Tuple[Tuple[float, int, str], str, int, Dict[str, Any]]] = None
+        for user_id in sorted(item_to_users.get(str(over_item), set())):
+            ranked_rows = sorted(
+                selected_by_user.get(str(user_id), []),
+                key=lambda row: (-float(row.get(self.base_score_col, 0.0)), str(row.get("item_id", ""))),
+            )
+            for idx, row in enumerate(ranked_rows):
+                if str(row.get("item_id")) != str(over_item):
+                    continue
+                rank = idx + 1
+                key = (float(row.get(self.base_score_col, 0.0)), -rank, str(user_id))
+                if best is None or key < best[0]:
+                    best = (key, str(user_id), idx, row)
+                break
+        if best is None:
+            return None
+        _, user_id, idx, row = best
+        return user_id, idx, row
+
+    def _replacement_from_group(
+        self,
+        user_id: str,
+        candidate_groups: Mapping[str, pd.DataFrame],
+        selected_items: set,
+        exposure: Mapping[str, int],
+        capacity: Mapping[str, int],
+    ) -> Optional[Dict[str, Any]]:
+        """Select the best currently feasible replacement for one user."""
+        pool = candidate_groups.get(str(user_id))
+        if pool is None or pool.empty:
+            return None
+        for _, row in pool.iterrows():
+            item_id = str(row["item_id"])
+            if item_id in selected_items:
+                continue
+            if int(exposure.get(item_id, 0)) >= int(capacity.get(item_id, 0)):
+                continue
+            replacement = row.to_dict()
+            replacement["user_id"] = str(user_id)
+            replacement["item_id"] = item_id
+            return replacement
+        return None
+
     def recommend_batch(
         self,
         candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
@@ -636,69 +743,93 @@ class EcommercePostProcessingAgent(_EcommerceCapacityBase):
         diagnostics["initial_constraints"] = self._compact_constraints(initial_constraints)
 
         capacity = self._capacity_map(candidates)
+        candidate_groups = {
+            str(user_id): group.reset_index(drop=True)
+            for user_id, group in candidates.groupby("user_id", sort=False)
+        }
+        selected_by_user, selected_items_by_user, item_to_users, exposure = self._selected_state(recs)
         iterations = 0
         while iterations < self.config.max_repair_iterations:
-            exposure = self._exposure_counts(recs)
             over_items = [item_id for item_id, count in exposure.items() if count > int(capacity.get(item_id, 0))]
             if not over_items:
                 break
 
             repaired_any = False
             for over_item in sorted(over_items):
-                exposure = self._exposure_counts(recs)
-                if int(exposure.get(over_item, 0)) <= int(capacity.get(over_item, 0)):
-                    continue
-
-                rows = recs.loc[recs["item_id"].astype(str) == over_item].sort_values(
-                    [self.base_score_col, "rank", "user_id"],
-                    ascending=[True, False, True],
-                )
-                if rows.empty:
-                    continue
-                remove_idx = int(rows.index[0])
-                removed = recs.loc[remove_idx].copy()
-                user_id = str(removed["user_id"])
-                recs_without = recs.drop(index=remove_idx).reset_index(drop=True)
-                exposure_without = self._exposure_counts(recs_without)
-                replacement = self._find_replacement(
-                    user_id=user_id,
-                    candidates=candidates,
-                    current_recs=recs_without,
-                    exposure=exposure_without,
-                    capacity=capacity,
-                )
-                if replacement is not None:
-                    recs = pd.concat([recs_without, replacement.to_frame().T], ignore_index=True)
-                    added_item = str(replacement["item_id"])
-                else:
-                    recs = recs_without
-                    added_item = None
-                recs = self._rerank(recs)
-                diagnostics["swap_log"].append(
-                    {
-                        "reason": "capacity_repair",
-                        "user_id": user_id,
-                        "removed_item_id": str(removed["item_id"]),
-                        "added_item_id": added_item,
-                    }
-                )
-                iterations += 1
-                diagnostics["search_steps"] = int(iterations)
-                repaired_any = True
-                if self.config.progress_interval > 0 and iterations % self.config.progress_interval == 0:
-                    progress = self.constraint_handler.evaluate_all(recs)
-                    LOGGER.info(
-                        "Scenario-1 postprocessing repair progress: swaps=%s/%s, overflow=%.4f, over_items=%s",
-                        iterations,
-                        self.config.max_repair_iterations,
-                        float(progress.get("capacity_violation_total", 0.0)),
-                        int(progress.get("over_capacity_item_count", 0)),
+                while (
+                    int(exposure.get(over_item, 0)) > int(capacity.get(over_item, 0))
+                    and iterations < self.config.max_repair_iterations
+                ):
+                    removal = self._removal_choice(over_item, selected_by_user, item_to_users)
+                    if removal is None:
+                        break
+                    user_id, remove_idx, removed = removal
+                    user_rows = sorted(
+                        selected_by_user.get(user_id, []),
+                        key=lambda row: (-float(row.get(self.base_score_col, 0.0)), str(row.get("item_id", ""))),
                     )
-                if iterations >= self.config.max_repair_iterations:
-                    break
+                    if remove_idx >= len(user_rows):
+                        break
+
+                    removed_item = str(removed["item_id"])
+                    user_rows.pop(remove_idx)
+                    selected_by_user[user_id] = user_rows
+                    selected_items = selected_items_by_user.setdefault(user_id, set())
+                    selected_items.discard(removed_item)
+                    exposure[removed_item] = max(0, int(exposure.get(removed_item, 0)) - 1)
+                    if removed_item in item_to_users:
+                        item_to_users[removed_item].discard(user_id)
+
+                    replacement = self._replacement_from_group(
+                        user_id=user_id,
+                        candidate_groups=candidate_groups,
+                        selected_items=selected_items,
+                        exposure=exposure,
+                        capacity=capacity,
+                    )
+                    if replacement is not None:
+                        added_item = str(replacement["item_id"])
+                        user_rows.append(replacement)
+                        selected_items.add(added_item)
+                        exposure[added_item] = int(exposure.get(added_item, 0)) + 1
+                        item_to_users.setdefault(added_item, set()).add(user_id)
+                    else:
+                        added_item = None
+                    selected_by_user[user_id] = sorted(
+                        user_rows,
+                        key=lambda row: (-float(row.get(self.base_score_col, 0.0)), str(row.get("item_id", ""))),
+                    )
+
+                    diagnostics["swap_log"].append(
+                        {
+                            "reason": "capacity_repair",
+                            "user_id": user_id,
+                            "removed_item_id": removed_item,
+                            "added_item_id": added_item,
+                        }
+                    )
+                    iterations += 1
+                    diagnostics["search_steps"] = int(iterations)
+                    repaired_any = True
+                    if self.config.progress_interval > 0 and iterations % self.config.progress_interval == 0:
+                        overflow_total = sum(
+                            max(0, int(count) - int(capacity.get(item_id, 0)))
+                            for item_id, count in exposure.items()
+                        )
+                        over_item_count = sum(
+                            1 for item_id, count in exposure.items() if int(count) > int(capacity.get(item_id, 0))
+                        )
+                        LOGGER.info(
+                            "Scenario-1 postprocessing repair progress: swaps=%s/%s, overflow=%.4f, over_items=%s",
+                            iterations,
+                            self.config.max_repair_iterations,
+                            float(overflow_total),
+                            int(over_item_count),
+                        )
             if not repaired_any:
                 break
 
+        recs = self._state_to_dataframe(selected_by_user, users, candidates)
         final_constraints = self.constraint_handler.evaluate_all(recs)
         diagnostics["final_constraints"] = self._compact_constraints(final_constraints)
         diagnostics["fully_repaired"] = bool(final_constraints.get("all_hard_constraints_satisfied", False))
@@ -838,14 +969,7 @@ class EcommerceInProcessingAgent(_EcommerceCapacityBase):
             for item_id in set(annotated["item_id"].astype(str).tolist()) | set(capacity.keys())
         }
 
-        candidate_rank = pd.Series(0, index=annotated.index, dtype=int)
-        for _, group in annotated.groupby("user_id", sort=False):
-            ordered = group.sort_values([self.base_score_col, "item_id"], ascending=[False, True])
-            for rank, (idx, row) in enumerate(ordered.iterrows(), start=1):
-                del row
-                candidate_rank.loc[idx] = int(rank)
-
-        annotated["_candidate_rank"] = candidate_rank.astype(int)
+        annotated["_candidate_rank"] = annotated.groupby("user_id", sort=False).cumcount() + 1
         annotated["_raw_item_congestion"] = annotated["item_id"].map(
             lambda item_id: float(congestion.get(str(item_id), 0.0))
         )
@@ -868,21 +992,13 @@ class EcommerceInProcessingAgent(_EcommerceCapacityBase):
         """Select each user's Top-K by adjusted score without hard capacity projection."""
         if candidates.empty or self.top_k <= 0:
             return candidates.head(0).copy(), 0
-        selected: List[pd.DataFrame] = []
-        search_steps = 0
-        for user_id in users:
-            group = candidates.loc[candidates["user_id"].astype(str) == str(user_id)].copy()
-            if group.empty:
-                continue
-            search_steps += int(len(group))
-            group = group.sort_values(
-                ["_inprocess_score", self.base_score_col, "item_id"],
-                ascending=[False, False, True],
-            ).head(self.top_k)
-            selected.append(group)
-        if not selected:
+        user_set = {str(user_id) for user_id in users}
+        source = candidates.loc[candidates["user_id"].isin(user_set)].copy()
+        search_steps = int(len(source))
+        if source.empty:
             return candidates.head(0).copy(), int(search_steps)
-        return self._drop_internal_columns(self._rerank(pd.concat(selected, ignore_index=True))), int(search_steps)
+        selected = source.groupby("user_id", sort=False, group_keys=False).head(self.top_k)
+        return self._drop_internal_columns(self._rerank(selected.reset_index(drop=True))), int(search_steps)
 
     def recommend_batch(
         self,
