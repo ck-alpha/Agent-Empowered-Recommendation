@@ -416,6 +416,7 @@ class EcommercePostProcessingConfig:
     top_k: int = 10
     base_score_col: str = "base_score"
     capacity_col: str = "inventory_initial"
+    consumption_col: Optional[str] = None
     max_repair_iterations: int = 10_000
     progress_interval: int = 500
 
@@ -423,12 +424,13 @@ class EcommercePostProcessingConfig:
 class _EcommerceCapacityBase:
     """Shared utilities for scenario-1 capacity-only baselines."""
 
-    def __init__(self, top_k: int, base_score_col: str, capacity_col: str):
+    def __init__(self, top_k: int, base_score_col: str, capacity_col: str, consumption_col: Optional[str] = None):
         self.top_k = max(0, int(top_k))
         self.base_score_col = str(base_score_col)
         self.capacity_col = str(capacity_col)
+        self.consumption_col = str(consumption_col) if consumption_col else None
         self.constraint_handler = EcommerceConstraintHandler(
-            EcommerceConstraintConfig(capacity_col=self.capacity_col)
+            EcommerceConstraintConfig(capacity_col=self.capacity_col, consumption_col=self.consumption_col)
         )
 
     @staticmethod
@@ -442,7 +444,10 @@ class _EcommerceCapacityBase:
     def _prepare_candidates(self, candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]]) -> pd.DataFrame:
         df = self._to_dataframe(candidate_items)
         if df.empty:
-            return pd.DataFrame(columns=["user_id", "item_id", self.base_score_col, self.capacity_col])
+            columns = ["user_id", "item_id", self.base_score_col, self.capacity_col]
+            if self.consumption_col:
+                columns.append(self.consumption_col)
+            return pd.DataFrame(columns=columns)
         required = ["user_id", "item_id", self.capacity_col]
         missing = [col for col in required if col not in df.columns]
         if missing:
@@ -455,8 +460,17 @@ class _EcommerceCapacityBase:
         df["item_id"] = df["item_id"].astype(str)
         df[self.base_score_col] = pd.to_numeric(df[self.base_score_col], errors="coerce").fillna(0.0).astype(float)
         df[self.capacity_col] = (
-            pd.to_numeric(df[self.capacity_col], errors="coerce").fillna(0.0).clip(lower=0.0).astype(int)
+            pd.to_numeric(df[self.capacity_col], errors="coerce").fillna(0.0).clip(lower=0.0).astype(float)
         )
+        if self.consumption_col:
+            if self.consumption_col not in df.columns:
+                df[self.consumption_col] = 1.0
+            df[self.consumption_col] = (
+                pd.to_numeric(df[self.consumption_col], errors="coerce")
+                .fillna(0.0)
+                .clip(lower=0.0)
+                .astype(float)
+            )
         return df.sort_values(
             ["user_id", self.base_score_col, "item_id"],
             ascending=[True, False, True],
@@ -470,13 +484,13 @@ class _EcommerceCapacityBase:
             return []
         return candidates["user_id"].drop_duplicates().astype(str).tolist()
 
-    def _capacity_map(self, candidates: pd.DataFrame) -> Dict[str, int]:
+    def _capacity_map(self, candidates: pd.DataFrame) -> Dict[str, float]:
         if candidates.empty:
             return {}
         return (
             candidates.drop_duplicates("item_id", keep="first")
             .set_index("item_id")[self.capacity_col]
-            .astype(int)
+            .astype(float)
             .clip(lower=0)
             .to_dict()
         )
@@ -610,7 +624,12 @@ class EcommercePostProcessingAgent(_EcommerceCapacityBase):
 
     def __init__(self, config: Optional[EcommercePostProcessingConfig] = None):
         self.config = config or EcommercePostProcessingConfig()
-        super().__init__(self.config.top_k, self.config.base_score_col, self.config.capacity_col)
+        super().__init__(
+            self.config.top_k,
+            self.config.base_score_col,
+            self.config.capacity_col,
+            self.config.consumption_col,
+        )
 
     def _selected_state(
         self,
@@ -840,12 +859,119 @@ class EcommercePostProcessingAgent(_EcommerceCapacityBase):
 
 
 @dataclass
+class EcommerceOnlineGreedyConfig:
+    """Configuration for scenario-1 dynamic inventory online greedy baseline."""
+
+    top_k: int = 10
+    base_score_col: str = "base_score"
+    capacity_col: str = "inventory_initial"
+    consumption_col: str = "expected_consumption"
+
+
+class EcommerceOnlineGreedyAgent(_EcommerceCapacityBase):
+    """
+    Dynamic inventory baseline.
+
+    Users are served in the provided order. For each user, the agent greedily
+    takes the highest-scoring candidates whose expected consumption fits the
+    current remaining item inventory, then decrements that inventory.
+    """
+
+    def __init__(self, config: Optional[EcommerceOnlineGreedyConfig] = None):
+        self.config = config or EcommerceOnlineGreedyConfig()
+        super().__init__(
+            self.config.top_k,
+            self.config.base_score_col,
+            self.config.capacity_col,
+            self.config.consumption_col,
+        )
+
+    def recommend_batch(
+        self,
+        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
+        user_ids: Optional[Sequence[str]] = None,
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if top_k is not None:
+            self.top_k = max(0, int(top_k))
+        candidates = self._prepare_candidates(candidate_items)
+        users = self._candidate_order(candidates, user_ids)
+        diagnostics: Dict[str, Any] = {
+            "input_candidate_count": int(len(candidates)),
+            "user_count": int(len(users)),
+            "requested_top_k": int(self.top_k),
+            "num_swaps": 0,
+            "search_steps": 0,
+        }
+        if candidates.empty or not users or self.top_k == 0:
+            return self._empty_result(candidates, diagnostics)
+
+        raw_topk = self._initial_topk(candidates, users)
+        diagnostics["initial_constraints"] = self._compact_constraints(self.constraint_handler.evaluate_all(raw_topk))
+
+        remaining = {str(item_id): float(capacity) for item_id, capacity in self._capacity_map(candidates).items()}
+        candidate_groups = {
+            str(user_id): group.reset_index(drop=True)
+            for user_id, group in candidates.groupby("user_id", sort=False)
+        }
+        rows: List[Dict[str, Any]] = []
+        user_remaining_after: Dict[str, float] = {}
+        search_steps = 0
+        for user_id in users:
+            pool = candidate_groups.get(str(user_id))
+            if pool is None or pool.empty:
+                user_remaining_after[str(user_id)] = float(sum(max(0.0, v) for v in remaining.values()))
+                continue
+            selected_items: set = set()
+            rank = 0
+            for _, row in pool.iterrows():
+                search_steps += 1
+                item_id = str(row["item_id"])
+                if item_id in selected_items:
+                    continue
+                consumption = float(row.get(self.consumption_col or "", 1.0))
+                if consumption < 0.0:
+                    consumption = 0.0
+                if float(remaining.get(item_id, 0.0)) + 1e-9 < consumption:
+                    continue
+                rank += 1
+                out = row.to_dict()
+                out["user_id"] = str(user_id)
+                out["item_id"] = item_id
+                out["rank"] = int(rank)
+                rows.append(out)
+                selected_items.add(item_id)
+                remaining[item_id] = float(remaining.get(item_id, 0.0)) - consumption
+                if rank >= self.top_k:
+                    break
+            user_remaining_after[str(user_id)] = float(sum(max(0.0, v) for v in remaining.values()))
+
+        if rows:
+            recs = pd.DataFrame(rows)
+        else:
+            recs = candidates.head(0).copy()
+            recs["rank"] = pd.Series(dtype=int)
+
+        final_constraints = self.constraint_handler.evaluate_all(recs)
+        diagnostics["final_constraints"] = self._compact_constraints(final_constraints)
+        diagnostics["fully_repaired"] = bool(final_constraints.get("all_hard_constraints_satisfied", False))
+        diagnostics["search_steps"] = int(search_steps)
+        diagnostics["candidate_shortage_rate"] = self._candidate_shortage_rate(recs, users)
+        diagnostics["final_utility"] = self._utility(recs)
+        diagnostics["remaining_inventory_total"] = float(sum(max(0.0, value) for value in remaining.values()))
+        diagnostics["depleted_item_count"] = int(sum(1 for value in remaining.values() if value <= 1e-9))
+        diagnostics["remaining_inventory_after_user"] = user_remaining_after
+        return {"recommendations": self._rerank(recs), "diagnostics": diagnostics}
+
+
+@dataclass
 class EcommerceInProcessingConfig:
     """Configuration for scenario-1 capacity-only in-processing baseline."""
 
     top_k: int = 10
     base_score_col: str = "base_score"
     capacity_col: str = "inventory_initial"
+    consumption_col: Optional[str] = None
     random_seed: int = RANDOM_SEED
     dual_iterations: int = 30
     dual_step_size: float = 0.35
@@ -865,7 +991,12 @@ class EcommerceInProcessingAgent(_EcommerceCapacityBase):
 
     def __init__(self, config: Optional[EcommerceInProcessingConfig] = None):
         self.config = config or EcommerceInProcessingConfig()
-        super().__init__(self.config.top_k, self.config.base_score_col, self.config.capacity_col)
+        super().__init__(
+            self.config.top_k,
+            self.config.base_score_col,
+            self.config.capacity_col,
+            self.config.consumption_col,
+        )
 
     @staticmethod
     def _stable_seed(user_id: str, seed: int) -> int:

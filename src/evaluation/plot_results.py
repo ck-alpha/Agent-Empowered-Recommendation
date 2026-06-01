@@ -25,8 +25,13 @@ import seaborn as sns
 LOGGER = logging.getLogger(__name__)
 STRATEGY_ORDER = ["bpr", "item_knn", "pop"]
 STRATEGY_LABELS = {"bpr": "BPR", "item_knn": "Item-KNN", "pop": "Popularity"}
-METHOD_ORDER = ["recall_only", "postprocessing", "inprocessing"]
-METHOD_LABELS = {"recall_only": "Recall", "postprocessing": "Post", "inprocessing": "In"}
+METHOD_ORDER = ["recall_only", "postprocessing", "inprocessing", "online_greedy"]
+METHOD_LABELS = {
+    "recall_only": "Recall",
+    "postprocessing": "Post",
+    "inprocessing": "In",
+    "online_greedy": "Online",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame]:
+def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     path = Path(metrics_json)
     if not path.exists():
         raise FileNotFoundError(f"Metrics JSON not found: {path}")
@@ -53,6 +58,7 @@ def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Da
     summaries_by_strategy = payload.get("summaries_by_strategy", {})
     summaries_by_method_strategy = payload.get("summaries_by_method_strategy", {})
     records = payload.get("records", [])
+    inventory_stats = payload.get("inventory_stats", [])
     recall_only = bool(summary.get("recall_only", False))
     default_method = "recall_only" if recall_only else "postprocessing"
     if not summary:
@@ -107,7 +113,8 @@ def load_metrics(metrics_json: str) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Da
     records_df["strategy"] = records_df["strategy"].astype(str).map(lambda value: STRATEGY_LABELS.get(value, value))
     summary_df["method_strategy"] = summary_df.apply(_method_strategy_label, axis=1)
     records_df["method_strategy"] = records_df.apply(_method_strategy_label, axis=1)
-    return summary, summary_df, records_df
+    inventory_df = pd.DataFrame(inventory_stats)
+    return summary, summary_df, records_df, inventory_df
 
 
 def _method_strategy_label(row: pd.Series) -> str:
@@ -495,11 +502,139 @@ def plot_method_constraint_utility_comparison(summary_df: pd.DataFrame, output_d
     return save_figure(fig, output_dir, "scenario1_method_constraint_utility_comparison", fmt, dpi)
 
 
+def _missing_columns(df: pd.DataFrame, columns: list[str]) -> list[str]:
+    return [col for col in columns if col not in df.columns]
+
+
+def plot_dynamic_pressure_tradeoff(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
+    required = ["realized_pressure", "final_ndcg_at_10", "agent_capacity_satisfaction_rate", "stockout_event"]
+    missing = _missing_columns(summary_df, required)
+    if missing:
+        LOGGER.info("Skipping dynamic pressure trade-off plot; missing columns: %s", missing)
+        return output_dir / f"scenario1_pressure_tradeoff.{fmt}"
+
+    x_col = _x_col(summary_df)
+    df = _to_numeric(summary_df, required).copy()
+    fig, axes = plt.subplots(1, 2, figsize=(max(9.6, 0.8 * df[x_col].nunique()), 3.9))
+    sns.scatterplot(
+        data=df,
+        x="realized_pressure",
+        y="final_ndcg_at_10",
+        hue=x_col,
+        size="stockout_event",
+        sizes=(60, 220),
+        ax=axes[0],
+    )
+    axes[0].set_title("Utility vs. Inventory Pressure")
+    axes[0].set_xlabel("Realized pressure")
+    axes[0].set_ylabel("NDCG@10")
+    axes[0].legend(title="Method/Strategy", frameon=True, fontsize=7)
+
+    sns.barplot(data=df, x=x_col, y="agent_capacity_satisfaction_rate", ax=axes[1])
+    axes[1].set_title("Expected-Capacity Satisfaction")
+    axes[1].set_xlabel("")
+    axes[1].set_ylabel("Rate")
+    axes[1].set_ylim(0, 1.08)
+    axes[1].tick_params(axis="x", rotation=25)
+    fig.suptitle("Dynamic Inventory Pressure Trade-off", y=1.03, fontweight="bold")
+    return save_figure(fig, output_dir, "scenario1_pressure_tradeoff", fmt, dpi)
+
+
+def plot_inventory_mechanism_robustness(summary_df: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
+    required = ["inventory_mechanism", "inventory_pressure", "agent_capacity_violation_total", "final_ndcg_at_10"]
+    missing = _missing_columns(summary_df, required)
+    if missing:
+        LOGGER.info("Skipping mechanism robustness plot; missing columns: %s", missing)
+        return output_dir / f"scenario1_mechanism_robustness.{fmt}"
+
+    x_col = _x_col(summary_df)
+    df = _to_numeric(summary_df, ["agent_capacity_violation_total", "final_ndcg_at_10"]).copy()
+    df["protocol"] = df["inventory_mechanism"].astype(str) + " / " + df["inventory_pressure"].astype(str)
+    plot_df = df.melt(
+        id_vars=["protocol", x_col],
+        value_vars=["agent_capacity_violation_total", "final_ndcg_at_10"],
+        var_name="Metric",
+        value_name="Value",
+    )
+    plot_df["Metric"] = plot_df["Metric"].map(
+        {"agent_capacity_violation_total": "Capacity violation", "final_ndcg_at_10": "NDCG@10"}
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.0))
+    for ax, metric in zip(axes, ["Capacity violation", "NDCG@10"]):
+        sub = plot_df[plot_df["Metric"] == metric]
+        sns.barplot(data=sub, x="protocol", y="Value", hue=x_col, ax=ax)
+        ax.set_title(metric)
+        ax.set_xlabel("")
+        ax.tick_params(axis="x", rotation=25)
+        ax.legend(title="Method/Strategy", frameon=True, fontsize=7)
+    fig.suptitle("Inventory Mechanism Robustness", y=1.03, fontweight="bold")
+    return save_figure(fig, output_dir, "scenario1_mechanism_robustness", fmt, dpi)
+
+
+def plot_dynamic_depletion(records: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
+    required = ["service_position", "remaining_inventory_after_user", "method_strategy"]
+    missing = _missing_columns(records, required)
+    if missing:
+        LOGGER.info("Skipping dynamic depletion plot; missing columns: %s", missing)
+        return output_dir / f"scenario1_dynamic_depletion.{fmt}"
+
+    df = _to_numeric(records, ["service_position", "remaining_inventory_after_user"]).dropna(subset=required)
+    df = df.loc[df["service_position"] > 0].copy()
+    if df.empty:
+        LOGGER.info("Skipping dynamic depletion plot; no positive service positions.")
+        return output_dir / f"scenario1_dynamic_depletion.{fmt}"
+    max_remaining = max(float(df["remaining_inventory_after_user"].max()), 1e-9)
+    df["remaining_inventory_rate"] = df["remaining_inventory_after_user"] / max_remaining
+    df["progress"] = df["service_position"] / max(float(df["service_position"].max()), 1.0)
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.0))
+    sns.lineplot(data=df, x="progress", y="remaining_inventory_rate", hue="method_strategy", errorbar=None, ax=ax)
+    ax.set_title("Dynamic Inventory Depletion")
+    ax.set_xlabel("Served user progress")
+    ax.set_ylabel("Remaining inventory rate")
+    ax.set_ylim(0, 1.05)
+    ax.legend(title="Method/Strategy", frameon=True)
+    return save_figure(fig, output_dir, "scenario1_dynamic_depletion", fmt, dpi)
+
+
+def plot_inventory_demand_diagnostics(inventory_df: pd.DataFrame, output_dir: Path, fmt: str, dpi: int) -> Path:
+    required = ["reference_demand", "inventory_capacity"]
+    missing = _missing_columns(inventory_df, required)
+    if missing:
+        LOGGER.info("Skipping inventory diagnostics plot; missing columns: %s", missing)
+        return output_dir / f"scenario1_inventory_diagnostics.{fmt}"
+
+    df = _to_numeric(inventory_df, ["reference_demand", "inventory_capacity", "inventory_pressure_realized"]).copy()
+    hue = "inventory_mechanism" if "inventory_mechanism" in df.columns else None
+    sample_df = df.sample(n=min(len(df), 5000), random_state=42) if len(df) > 5000 else df
+    fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.0))
+    sns.scatterplot(
+        data=sample_df,
+        x="reference_demand",
+        y="inventory_capacity",
+        hue=hue,
+        alpha=0.55,
+        s=18,
+        ax=axes[0],
+        legend=bool(hue),
+    )
+    axes[0].set_title("Demand-Calibrated Inventory")
+    axes[0].set_xlabel("Reference expected demand")
+    axes[0].set_ylabel("Initial inventory")
+
+    sns.histplot(data=df, x="inventory_capacity", hue=hue, bins=40, log_scale=(False, True), ax=axes[1])
+    axes[1].set_title("Inventory Distribution")
+    axes[1].set_xlabel("Initial inventory")
+    axes[1].set_ylabel("Item count")
+    fig.suptitle("Inventory Protocol Diagnostics", y=1.03, fontweight="bold")
+    return save_figure(fig, output_dir, "scenario1_inventory_diagnostics", fmt, dpi)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     args = parse_args()
     setup_style()
-    summary, summary_df, records = load_metrics(args.metrics_json)
+    summary, summary_df, records, inventory_df = load_metrics(args.metrics_json)
     output_dir = Path(args.output_dir)
 
     plot_recall_accuracy_comparison(summary_df, output_dir, args.format, args.dpi)
@@ -517,6 +652,10 @@ def main() -> None:
     plot_shortage_utility(records, output_dir, args.format, args.dpi)
     plot_swaps_vs_utility(records, output_dir, args.format, args.dpi)
     plot_method_constraint_utility_comparison(summary_df, output_dir, args.format, args.dpi)
+    plot_dynamic_pressure_tradeoff(summary_df, output_dir, args.format, args.dpi)
+    plot_inventory_mechanism_robustness(summary_df, output_dir, args.format, args.dpi)
+    plot_dynamic_depletion(records, output_dir, args.format, args.dpi)
+    plot_inventory_demand_diagnostics(inventory_df, output_dir, args.format, args.dpi)
 
 
 if __name__ == "__main__":

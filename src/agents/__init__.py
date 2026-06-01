@@ -8,6 +8,8 @@ from .exploration_agent import ExplorationAgent
 from .baseline_agents import (
     EcommerceInProcessingAgent,
     EcommerceInProcessingConfig,
+    EcommerceOnlineGreedyAgent,
+    EcommerceOnlineGreedyConfig,
     EcommercePostProcessingAgent,
     EcommercePostProcessingConfig,
     GreedyRerankConfig,
@@ -29,6 +31,8 @@ __all__ = [
     'ExplorationAgent',
     'EcommerceInProcessingAgent',
     'EcommerceInProcessingConfig',
+    'EcommerceOnlineGreedyAgent',
+    'EcommerceOnlineGreedyConfig',
     'EcommercePostProcessingAgent',
     'EcommercePostProcessingConfig',
     'InProcessingConfig',

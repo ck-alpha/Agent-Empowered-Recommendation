@@ -1,6 +1,5 @@
 from pathlib import Path
 import sys
-
 import pandas as pd
 
 
@@ -9,12 +8,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from agents import (  # noqa: E402
     EcommerceInProcessingAgent,
     EcommerceInProcessingConfig,
+    EcommerceOnlineGreedyAgent,
+    EcommerceOnlineGreedyConfig,
     EcommercePostProcessingAgent,
     EcommercePostProcessingConfig,
 )
 from constraints import EcommerceConstraintConfig, EcommerceConstraintHandler  # noqa: E402
 from run_scenario1_baselines import (  # noqa: E402
+    annotate_expected_consumption,
+    apply_dynamic_inventory_protocol,
     build_id_mappings,
+    build_raw_topk_recommendations,
     iterative_k_core_filter,
     make_data_stat,
     sample_test_users,
@@ -37,6 +41,78 @@ def test_capacity_diagnostics_counts_overflow() -> None:
     assert diagnostics["capacity_violation_total"] == 1.0
     assert diagnostics["over_capacity_item_count"] == 1
     assert diagnostics["max_capacity_overflow"] == 1.0
+
+
+def test_capacity_diagnostics_supports_expected_consumption() -> None:
+    recs = pd.DataFrame(
+        [
+            {"user_id": "u1", "item_id": "A", "inventory_capacity": 1.0, "expected_consumption": 0.6},
+            {"user_id": "u2", "item_id": "A", "inventory_capacity": 1.0, "expected_consumption": 0.7},
+        ]
+    )
+
+    handler = EcommerceConstraintHandler(
+        EcommerceConstraintConfig(capacity_col="inventory_capacity", consumption_col="expected_consumption")
+    )
+    diagnostics = handler.evaluate_all(recs)
+
+    assert diagnostics["capacity_satisfied"] is False
+    assert abs(diagnostics["capacity_violation_total"] - 0.3) < 1e-9
+    assert diagnostics["consumption_mode"] == "expected"
+    assert abs(diagnostics["total_consumption"] - 1.3) < 1e-9
+
+
+def test_online_greedy_respects_dynamic_expected_inventory() -> None:
+    candidates = pd.DataFrame(
+        [
+            {"user_id": "u1", "item_id": "A", "base_score": 1.0, "inventory_capacity": 1.0, "expected_consumption": 0.7},
+            {"user_id": "u1", "item_id": "B", "base_score": 0.8, "inventory_capacity": 1.0, "expected_consumption": 0.5},
+            {"user_id": "u2", "item_id": "A", "base_score": 1.0, "inventory_capacity": 1.0, "expected_consumption": 0.7},
+            {"user_id": "u2", "item_id": "C", "base_score": 0.7, "inventory_capacity": 1.0, "expected_consumption": 0.4},
+        ]
+    )
+    agent = EcommerceOnlineGreedyAgent(
+        EcommerceOnlineGreedyConfig(top_k=1, capacity_col="inventory_capacity", consumption_col="expected_consumption")
+    )
+
+    result = agent.recommend_batch(candidates, user_ids=["u1", "u2"], top_k=1)
+    recs = result["recommendations"]
+
+    assert recs["item_id"].tolist() == ["A", "C"]
+    assert result["diagnostics"]["final_constraints"]["capacity_satisfied"] is True
+
+
+def test_dynamic_inventory_protocol_pressure_ordering() -> None:
+    candidates = pd.DataFrame(
+        [
+            {"user_id": "u1", "item_id": "A", "base_score": 1.0, "inventory_initial": 5, "popularity": 1.0},
+            {"user_id": "u1", "item_id": "B", "base_score": 0.8, "inventory_initial": 5, "popularity": 0.5},
+            {"user_id": "u2", "item_id": "A", "base_score": 1.0, "inventory_initial": 5, "popularity": 1.0},
+            {"user_id": "u2", "item_id": "C", "base_score": 0.7, "inventory_initial": 5, "popularity": 0.2},
+        ]
+    )
+    annotated = annotate_expected_consumption(candidates, top_k=1, expected_orders_per_user=1.0)
+    raw = build_raw_topk_recommendations(annotated, top_k=1)
+
+    abundant, abundant_summary, _ = apply_dynamic_inventory_protocol(
+        annotated,
+        raw,
+        mechanism="demand_aligned",
+        pressure_level="abundant",
+        seed=42,
+    )
+    scarce, scarce_summary, _ = apply_dynamic_inventory_protocol(
+        annotated,
+        raw,
+        mechanism="demand_aligned",
+        pressure_level="scarce",
+        seed=42,
+    )
+
+    assert abundant_summary["inventory_total"] >= scarce_summary["inventory_total"]
+    assert scarce_summary["realized_pressure"] >= abundant_summary["realized_pressure"]
+    assert "inventory_capacity" in abundant.columns
+    assert "inventory_capacity" in scarce.columns
 
 
 def test_postprocessing_repairs_over_capacity_with_candidate_replacement() -> None:

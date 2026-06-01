@@ -281,14 +281,18 @@ class EcommerceConstraintConfig:
     """场景一电商库存容量硬约束配置。"""
 
     capacity_col: str = "inventory_initial"
+    consumption_col: Optional[str] = None
 
 
 class EcommerceConstraintHandler:
     """
     场景一（电商环境）库存容量硬约束处理器。
 
-    推荐矩阵上的唯一约束是全局库存容量：
-        sum_u 1(item_i in R_u) <= inventory_initial_i
+        推荐矩阵上的唯一约束是全局库存容量。默认使用曝光计数：
+            sum_u 1(item_i in R_u) <= inventory_initial_i
+
+        若配置 consumption_col，则使用期望消耗：
+            sum_u consumption_ui <= capacity_i
 
     输入可以是 pandas DataFrame，也可以是记录字典列表；内部统一转成
     DataFrame 后计算 item-level exposure 与 capacity overflow。
@@ -317,12 +321,14 @@ class EcommerceConstraintHandler:
         self,
         recommendations: Union[pd.DataFrame, List[Dict[str, Any]]],
         capacity_col: Optional[str] = None,
+        consumption_col: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         评估全局库存容量约束。
 
         capacity_satisfaction_rate 以被曝光商品为分母，衡量有多少被曝光商品
-        没有超过库存容量。未曝光商品不进入该分母。
+        没有超过库存容量。未曝光商品不进入该分母。若配置 consumption_col，
+        exposure_count 表示期望消耗总量，而不是行数。
         """
         df = self._to_dataframe(recommendations)
         if df.empty:
@@ -333,19 +339,36 @@ class EcommerceConstraintHandler:
                 "max_capacity_overflow": 0.0,
                 "capacity_satisfaction_rate": 1.0,
                 "mean_item_utilization": 0.0,
+                "consumption_mode": "count",
+                "total_consumption": 0.0,
+                "total_capacity": 0.0,
                 "exposure_by_item": pd.DataFrame(
                     columns=["item_id", "capacity_max", "exposure_count", "overflow"]
                 ),
             }
 
         col = self.config.capacity_col if capacity_col is None else str(capacity_col)
-        self._require_columns(df, ["item_id", col], "capacity_diagnostics")
+        consume_col = self.config.consumption_col if consumption_col is None else consumption_col
+        required = ["item_id", col]
+        if consume_col:
+            required.append(str(consume_col))
+        self._require_columns(df, required, "capacity_diagnostics")
 
-        work = df[["item_id", col]].copy()
+        work_cols = ["item_id", col] + ([str(consume_col)] if consume_col else [])
+        work = df[work_cols].copy()
         work["item_id"] = work["item_id"].astype(str)
         work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0).clip(lower=0.0)
 
-        exposure = work["item_id"].value_counts().rename("exposure_count").astype(float)
+        if consume_col:
+            work[str(consume_col)] = (
+                pd.to_numeric(work[str(consume_col)], errors="coerce").fillna(0.0).clip(lower=0.0)
+            )
+            exposure = work.groupby("item_id")[str(consume_col)].sum().rename("exposure_count").astype(float)
+            consumption_mode = "expected"
+        else:
+            exposure = work["item_id"].value_counts().rename("exposure_count").astype(float)
+            consumption_mode = "count"
+
         capacity = (
             work.drop_duplicates("item_id", keep="first")
             .set_index("item_id")[col]
@@ -373,6 +396,9 @@ class EcommerceConstraintHandler:
             "max_capacity_overflow": float(joined["overflow"].max()) if len(joined) else 0.0,
             "capacity_satisfaction_rate": satisfaction_rate,
             "mean_item_utilization": float(finite_utilization.mean()) if not finite_utilization.empty else 0.0,
+            "consumption_mode": consumption_mode,
+            "total_consumption": float(joined["exposure_count"].sum()),
+            "total_capacity": float(joined["capacity_max"].sum()),
             "exposure_by_item": joined.reset_index()[["item_id", "capacity_max", "exposure_count", "overflow"]],
         }
 
@@ -380,6 +406,7 @@ class EcommerceConstraintHandler:
         self,
         recommendations: Union[pd.DataFrame, List[Dict[str, Any]]],
         capacity_col: Optional[str] = None,
+        consumption_col: Optional[str] = None,
         **_: Any,
     ) -> Dict[str, Any]:
         """
@@ -388,7 +415,11 @@ class EcommerceConstraintHandler:
         **_ 用于兼容旧调用签名；场景一新实验不再评估预算、新品、
         供应商或 stockout 机会约束。
         """
-        diagnostics = self.capacity_diagnostics(recommendations, capacity_col=capacity_col)
+        diagnostics = self.capacity_diagnostics(
+            recommendations,
+            capacity_col=capacity_col,
+            consumption_col=consumption_col,
+        )
         compact = dict(diagnostics)
         compact.pop("exposure_by_item", None)
         compact["all_hard_constraints_satisfied"] = bool(compact.get("capacity_satisfied", False))

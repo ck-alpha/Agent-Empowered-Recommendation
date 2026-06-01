@@ -59,6 +59,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from agents import (
     EcommerceInProcessingAgent,
     EcommerceInProcessingConfig,
+    EcommerceOnlineGreedyAgent,
+    EcommerceOnlineGreedyConfig,
     EcommercePostProcessingAgent,
     EcommercePostProcessingConfig,
 )
@@ -70,9 +72,14 @@ EPS = 1e-9
 SINGLE_STRATEGIES = ["bpr", "item_knn", "pop"]
 BPR_STRATEGIES = {"bpr"}
 ITEM_KNN_STRATEGIES = {"item_knn"}
+INVENTORY_PRESSURE_VALUES = {"abundant": 0.75, "medium": 1.0, "scarce": 1.25}
 REQUIRED_ITEM_COLUMNS = [
     "item_id",
     "inventory_initial",
+]
+OPTIONAL_ITEM_COLUMNS = [
+    "popularity",
+    "interaction_count",
 ]
 
 
@@ -142,6 +149,10 @@ class EvalRecord:
     changed_item_count: int
     final_hit_at_10: float
     final_ndcg_at_10: float
+    expected_consumption_sum: float
+    stockout_event: bool
+    remaining_inventory_after_user: float
+    service_position: int
     raw_item_ids: List[str]
     final_item_ids: List[str]
 
@@ -229,9 +240,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hybrid_bpr_weight", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument(
         "--baseline_mode",
-        choices=["postprocessing", "inprocessing", "both"],
+        choices=["postprocessing", "inprocessing", "online_greedy", "both", "all"],
         default="both",
         help="Constrained baseline layer to evaluate.",
+    )
+    parser.add_argument(
+        "--inventory_protocol",
+        choices=["legacy_static", "dynamic_expected"],
+        default="legacy_static",
+        help="Scenario-1 inventory protocol. legacy_static preserves exposure-count capacity.",
+    )
+    parser.add_argument(
+        "--inventory_mechanism",
+        choices=["demand_aligned", "popularity_aligned", "popular_scarce"],
+        default="demand_aligned",
+        help="Dynamic expected inventory synthesis mechanism.",
+    )
+    parser.add_argument(
+        "--inventory_pressure",
+        choices=["abundant", "medium", "scarce"],
+        default="medium",
+        help="Dynamic inventory pressure level: expected demand divided by inventory.",
+    )
+    parser.add_argument(
+        "--expected_orders_per_user",
+        type=float,
+        default=1.0,
+        help="Expected purchases represented by one served user's recommendation slate.",
+    )
+    parser.add_argument(
+        "--serving_order",
+        choices=["test_timestamp"],
+        default="test_timestamp",
+        help="Dynamic inventory serving order.",
     )
     parser.add_argument("--recall_only", action="store_true", help="Only evaluate recall metrics; skip processing agents.")
     parser.add_argument("--show_progress", action="store_true", help="Show BPR / Item-KNN training progress.")
@@ -243,7 +284,11 @@ def resolve_strategies(strategy: str) -> List[str]:
 
 
 def resolve_methods(baseline_mode: str) -> List[str]:
-    return ["postprocessing", "inprocessing"] if baseline_mode == "both" else [baseline_mode]
+    if baseline_mode == "both":
+        return ["postprocessing", "inprocessing"]
+    if baseline_mode == "all":
+        return ["postprocessing", "inprocessing", "online_greedy"]
+    return [baseline_mode]
 
 
 def ensure_torch_available(required: bool = True) -> None:
@@ -937,7 +982,8 @@ def _build_group_index(catalog: pd.DataFrame, group_col: str) -> Dict[str, Tuple
 def build_recall_cache(items: pd.DataFrame, popularity_scores: pd.Series) -> RecallCache:
     """Precompute indexes that avoid per-user full-catalog scans in fast backend."""
     catalog = build_item_catalog(items, popularity_scores)
-    items_by_id = items[REQUIRED_ITEM_COLUMNS].copy()
+    feature_cols = REQUIRED_ITEM_COLUMNS + [col for col in OPTIONAL_ITEM_COLUMNS if col in items.columns]
+    items_by_id = items[feature_cols].copy()
     items_by_id["item_id"] = items_by_id["item_id"].astype(str)
     items_by_id = items_by_id.drop_duplicates("item_id", keep="first").set_index("item_id", drop=False)
 
@@ -1452,7 +1498,8 @@ def build_candidate_dataframe(
         candidates = pd.concat([recall.reset_index(drop=True), feature_values], axis=1)
         candidates = candidates.loc[~missing_mask].copy()
     else:
-        item_features = items[REQUIRED_ITEM_COLUMNS].copy()
+        feature_cols = REQUIRED_ITEM_COLUMNS + [col for col in OPTIONAL_ITEM_COLUMNS if col in items.columns]
+        item_features = items[feature_cols].copy()
         candidates = recall.merge(item_features, on="item_id", how="inner")
 
     missing_after_merge = len(recall) - len(candidates)
@@ -1574,10 +1621,218 @@ def item_ids_for_user(recommendations: pd.DataFrame, user_id: str) -> List[str]:
     return rows["item_id"].astype(str).tolist()
 
 
-def evaluate_capacity_constraints(recommendations: pd.DataFrame) -> Dict[str, Any]:
+def evaluate_capacity_constraints(
+    recommendations: pd.DataFrame,
+    *,
+    capacity_col: str = "inventory_initial",
+    consumption_col: Optional[str] = None,
+) -> Dict[str, Any]:
     """Evaluate scenario-1 capacity-only hard constraints for a recommendation matrix."""
-    handler = EcommerceConstraintHandler(EcommerceConstraintConfig(capacity_col="inventory_initial"))
+    handler = EcommerceConstraintHandler(
+        EcommerceConstraintConfig(capacity_col=capacity_col, consumption_col=consumption_col)
+    )
     return handler.evaluate_all(recommendations)
+
+
+def _pressure_value(level: str) -> float:
+    if level not in INVENTORY_PRESSURE_VALUES:
+        raise ValueError(f"Unsupported inventory pressure: {level}")
+    return float(INVENTORY_PRESSURE_VALUES[level])
+
+
+def annotate_expected_consumption(
+    candidates: pd.DataFrame,
+    *,
+    top_k: int,
+    expected_orders_per_user: float,
+    score_col: str = "base_score",
+    output_col: str = "expected_consumption",
+) -> pd.DataFrame:
+    """Calibrate candidate scores into expected purchase consumption weights."""
+    if candidates.empty:
+        out = candidates.copy()
+        out[output_col] = pd.Series(dtype=float)
+        return out
+    df = candidates.sort_values(["user_id", score_col, "item_id"], ascending=[True, False, True]).copy()
+    df["_candidate_rank_for_demand"] = df.groupby("user_id", sort=False).cumcount() + 1
+    scores = pd.to_numeric(df[score_col], errors="coerce").fillna(0.0).astype(float)
+    group_min = scores.groupby(df["user_id"]).transform("min")
+    group_max = scores.groupby(df["user_id"]).transform("max")
+    denom = (group_max - group_min).replace(0.0, np.nan)
+    normalized = ((scores - group_min) / denom).fillna(1.0).clip(lower=0.0)
+    rank_discount = 1.0 / np.log2(df["_candidate_rank_for_demand"].astype(float) + 1.0)
+    df["_demand_weight"] = (0.05 + normalized) * rank_discount
+    top_mask = df["_candidate_rank_for_demand"] <= max(1, int(top_k))
+    top_weight = df["_demand_weight"].where(top_mask, 0.0).groupby(df["user_id"]).transform("sum")
+    df[output_col] = (
+        float(max(0.0, expected_orders_per_user))
+        * df["_demand_weight"]
+        / top_weight.replace(0.0, np.nan)
+    ).fillna(0.0)
+    return df.drop(columns=["_candidate_rank_for_demand", "_demand_weight"]).reset_index(drop=True)
+
+
+def apply_dynamic_inventory_protocol(
+    candidates: pd.DataFrame,
+    raw_recs: pd.DataFrame,
+    *,
+    mechanism: str,
+    pressure_level: str,
+    seed: int,
+    capacity_col: str = "inventory_capacity",
+    consumption_col: str = "expected_consumption",
+) -> Tuple[pd.DataFrame, Dict[str, Any], pd.DataFrame]:
+    """Build demand-calibrated inventory capacities and attach them to candidates."""
+    if candidates.empty:
+        empty_stats = {
+            "inventory_protocol": "dynamic_expected",
+            "inventory_mechanism": mechanism,
+            "inventory_pressure": pressure_level,
+            "inventory_pressure_value": _pressure_value(pressure_level),
+        }
+        return candidates.copy(), empty_stats, pd.DataFrame()
+
+    pressure = _pressure_value(pressure_level)
+    rng = np.random.default_rng(seed)
+    work = candidates.copy()
+    work["item_id"] = work["item_id"].astype(str)
+    raw = raw_recs.copy()
+    raw["item_id"] = raw["item_id"].astype(str)
+
+    candidate_demand = work.groupby("item_id")[consumption_col].sum().rename("candidate_expected_demand")
+    raw_demand = raw.groupby("item_id")[consumption_col].sum().rename("raw_expected_demand")
+    item_frame = work.drop_duplicates("item_id", keep="first").set_index("item_id")
+    stats = item_frame.join(candidate_demand, how="left").join(raw_demand, how="left")
+    stats["candidate_expected_demand"] = stats["candidate_expected_demand"].fillna(0.0)
+    stats["raw_expected_demand"] = stats["raw_expected_demand"].fillna(0.0)
+    stats["reference_demand"] = (
+        stats["raw_expected_demand"] + 0.05 * (stats["candidate_expected_demand"] - stats["raw_expected_demand"]).clip(lower=0.0)
+    )
+
+    if mechanism == "demand_aligned":
+        base = stats["reference_demand"].to_numpy(dtype=float)
+    elif mechanism == "popularity_aligned":
+        if "popularity" in stats.columns:
+            popularity = pd.to_numeric(stats["popularity"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        else:
+            popularity = pd.Series(0.0, index=stats.index)
+        base = popularity.to_numpy(dtype=float)
+        if float(base.sum()) <= 0.0:
+            base = stats["reference_demand"].to_numpy(dtype=float)
+        else:
+            base = base / max(float(base.sum()), EPS) * max(float(stats["reference_demand"].sum()), EPS)
+    elif mechanism == "popular_scarce":
+        base_series = stats["reference_demand"].copy()
+        cutoff = float(base_series.quantile(0.90)) if len(base_series) else 0.0
+        scarce_mask = base_series >= cutoff
+        base_series.loc[scarce_mask] *= 0.55
+        base = base_series.to_numpy(dtype=float)
+    else:
+        raise ValueError(f"Unsupported inventory mechanism: {mechanism}")
+
+    noise = rng.lognormal(mean=0.0, sigma=0.08, size=len(stats))
+    capacities = np.ceil(np.maximum(base * noise / max(pressure, EPS), 0.0)).astype(float)
+    capacities = np.maximum(capacities, 1.0)
+    stats[capacity_col] = capacities
+    stats["inventory_pressure_realized"] = stats["reference_demand"] / stats[capacity_col].replace(0.0, np.nan)
+    stats["inventory_pressure_realized"] = stats["inventory_pressure_realized"].fillna(0.0)
+
+    capacity_map = stats[capacity_col].to_dict()
+    out = work.drop(columns=[capacity_col], errors="ignore").copy()
+    out[capacity_col] = out["item_id"].map(capacity_map).fillna(1.0).astype(float)
+
+    nonzero_demand = stats["reference_demand"] > 0.0
+    summary = {
+        "inventory_protocol": "dynamic_expected",
+        "inventory_mechanism": mechanism,
+        "inventory_pressure": pressure_level,
+        "inventory_pressure_value": pressure,
+        "inventory_total": float(stats[capacity_col].sum()),
+        "expected_demand_total": float(stats["reference_demand"].sum()),
+        "realized_pressure": float(stats["reference_demand"].sum() / max(float(stats[capacity_col].sum()), EPS)),
+        "item_count": int(len(stats)),
+        "zero_demand_item_rate": float((~nonzero_demand).mean()) if len(stats) else 0.0,
+        "scarce_item_rate": float((stats["inventory_pressure_realized"] > 1.0).mean()) if len(stats) else 0.0,
+        "demand_inventory_corr": float(stats["reference_demand"].corr(stats[capacity_col]))
+        if len(stats) > 1
+        else 0.0,
+        "inventory_min": float(stats[capacity_col].min()) if len(stats) else 0.0,
+        "inventory_mean": float(stats[capacity_col].mean()) if len(stats) else 0.0,
+        "inventory_median": float(stats[capacity_col].median()) if len(stats) else 0.0,
+        "inventory_p90": float(stats[capacity_col].quantile(0.90)) if len(stats) else 0.0,
+        "inventory_p95": float(stats[capacity_col].quantile(0.95)) if len(stats) else 0.0,
+        "inventory_max": float(stats[capacity_col].max()) if len(stats) else 0.0,
+        "expected_demand_mean": float(stats["reference_demand"].mean()) if len(stats) else 0.0,
+        "expected_demand_p90": float(stats["reference_demand"].quantile(0.90)) if len(stats) else 0.0,
+        "expected_demand_max": float(stats["reference_demand"].max()) if len(stats) else 0.0,
+    }
+    stats = stats.reset_index().rename(columns={"index": "item_id"})
+    return out, summary, stats
+
+
+def replay_dynamic_inventory(
+    recommendations: pd.DataFrame,
+    user_order: Sequence[str],
+    *,
+    capacity_col: str,
+    consumption_col: str,
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
+    """Replay a recommendation matrix in serving order and measure dynamic stockouts."""
+    if recommendations.empty:
+        return {
+            "dynamic_capacity_satisfied": True,
+            "dynamic_violation_total": 0.0,
+            "dynamic_stockout_item_count": 0,
+            "depleted_item_count": 0,
+            "remaining_inventory_total": 0.0,
+            "remaining_inventory_rate": 0.0,
+            "served_user_count": 0,
+        }, {}
+    recs = recommendations.copy()
+    recs["user_id"] = recs["user_id"].astype(str)
+    recs["item_id"] = recs["item_id"].astype(str)
+    recs[capacity_col] = pd.to_numeric(recs[capacity_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    recs[consumption_col] = pd.to_numeric(recs[consumption_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+    capacity = recs.drop_duplicates("item_id", keep="first").set_index("item_id")[capacity_col].astype(float).to_dict()
+    remaining = dict(capacity)
+    initial_total = float(sum(remaining.values()))
+    violation_total = 0.0
+    stockout_items: set = set()
+    user_stats: Dict[str, Dict[str, float]] = {}
+    groups = {str(user_id): group for user_id, group in recs.groupby("user_id", sort=False)}
+    for position, user_id in enumerate(user_order, start=1):
+        rows = groups.get(str(user_id), recs.head(0))
+        user_violation = 0.0
+        user_consumption = 0.0
+        for _, row in rows.iterrows():
+            item_id = str(row["item_id"])
+            consumption = float(row[consumption_col])
+            user_consumption += consumption
+            after = float(remaining.get(item_id, 0.0)) - consumption
+            if after < -EPS:
+                user_violation += -after
+                stockout_items.add(item_id)
+            remaining[item_id] = after
+        remaining_nonnegative = float(sum(max(0.0, value) for value in remaining.values()))
+        user_stats[str(user_id)] = {
+            "stockout_event": float(user_violation > 0.0),
+            "dynamic_violation": float(user_violation),
+            "expected_consumption_sum": float(user_consumption),
+            "remaining_inventory_after_user": remaining_nonnegative,
+            "service_position": float(position),
+        }
+        violation_total += user_violation
+    remaining_total = float(sum(max(0.0, value) for value in remaining.values()))
+    diagnostics = {
+        "dynamic_capacity_satisfied": bool(violation_total <= EPS),
+        "dynamic_violation_total": float(violation_total),
+        "dynamic_stockout_item_count": int(len(stockout_items)),
+        "depleted_item_count": int(sum(1 for value in remaining.values() if value <= EPS)),
+        "remaining_inventory_total": remaining_total,
+        "remaining_inventory_rate": float(remaining_total / max(initial_total, EPS)),
+        "served_user_count": int(len(user_order)),
+    }
+    return diagnostics, user_stats
 
 
 def run_reranking_evaluation(
@@ -1599,21 +1854,23 @@ def run_reranking_evaluation(
     seed: int,
     recall_backend: str,
     recall_cache: Optional[RecallCache],
-) -> List[EvalRecord]:
+    inventory_protocol: str = "legacy_static",
+    inventory_mechanism: str = "demand_aligned",
+    inventory_pressure: str = "medium",
+    expected_orders_per_user: float = 1.0,
+) -> Tuple[List[EvalRecord], Dict[str, Any], pd.DataFrame]:
     """Run recall and batch-level capacity-only processing baselines for sampled users."""
     del users
-    agents = {
-        "postprocessing": EcommercePostProcessingAgent(EcommercePostProcessingConfig(top_k=top_k)),
-        "inprocessing": EcommerceInProcessingAgent(EcommerceInProcessingConfig(top_k=top_k, random_seed=seed)),
-    }
-    selected_methods = [method for method in methods if method in agents]
-    if not selected_methods:
-        raise ValueError(f"No supported baseline methods selected: {methods}")
-
     records: List[EvalRecord] = []
     skipped_no_recall = 0
     user_rows: List[Dict[str, Any]] = []
     candidate_frames: List[pd.DataFrame] = []
+    inventory_summary: Dict[str, Any] = {
+        "inventory_protocol": inventory_protocol,
+        "inventory_mechanism": inventory_mechanism,
+        "inventory_pressure": inventory_pressure,
+    }
+    inventory_item_stats = pd.DataFrame()
 
     desc = f"Collecting candidates [{strategy}]"
     for row in tqdm(sampled_test.itertuples(index=False), total=len(sampled_test), desc=desc):
@@ -1657,6 +1914,7 @@ def run_reranking_evaluation(
             {
                 "user_id": user_id,
                 "ground_truth": ground_truth,
+                "timestamp": float(getattr(row, "timestamp", 0.0)),
                 "recall_count": int(len(recall_df)),
                 "recall_hit_at_k": float(recall_hr),
             }
@@ -1666,17 +1924,81 @@ def run_reranking_evaluation(
     if skipped_no_recall:
         LOGGER.warning("[%s] Skipped %s users because recall/feature join returned no candidates.", strategy, skipped_no_recall)
     if not user_rows or not candidate_frames:
-        return records
+        return records, inventory_summary, inventory_item_stats
 
     all_candidates = pd.concat(candidate_frames, ignore_index=True)
-    user_order = [row["user_id"] for row in user_rows]
+    user_order = [
+        row["user_id"]
+        for row in sorted(user_rows, key=lambda info: (float(info.get("timestamp", 0.0)), str(info["user_id"])))
+    ]
+
+    capacity_col = "inventory_initial"
+    consumption_col: Optional[str] = None
+    if inventory_protocol == "dynamic_expected":
+        consumption_col = "expected_consumption"
+        capacity_col = "inventory_capacity"
+        all_candidates = annotate_expected_consumption(
+            all_candidates,
+            top_k=top_k,
+            expected_orders_per_user=expected_orders_per_user,
+            output_col=consumption_col,
+        )
+
     raw_recs = build_raw_topk_recommendations(all_candidates, top_k=top_k, assume_sorted=True)
+    if inventory_protocol == "dynamic_expected":
+        all_candidates, inventory_summary, inventory_item_stats = apply_dynamic_inventory_protocol(
+            all_candidates,
+            raw_recs,
+            mechanism=inventory_mechanism,
+            pressure_level=inventory_pressure,
+            seed=seed,
+            capacity_col=capacity_col,
+            consumption_col=consumption_col,
+        )
+        raw_recs = build_raw_topk_recommendations(all_candidates, top_k=top_k, assume_sorted=True)
+
+    agents = {
+        "postprocessing": EcommercePostProcessingAgent(
+            EcommercePostProcessingConfig(top_k=top_k, capacity_col=capacity_col, consumption_col=consumption_col)
+        ),
+        "inprocessing": EcommerceInProcessingAgent(
+            EcommerceInProcessingConfig(
+                top_k=top_k,
+                capacity_col=capacity_col,
+                consumption_col=consumption_col,
+                random_seed=seed,
+            )
+        ),
+        "online_greedy": EcommerceOnlineGreedyAgent(
+            EcommerceOnlineGreedyConfig(top_k=top_k, capacity_col=capacity_col, consumption_col=consumption_col or "expected_consumption")
+        ),
+    }
+    selected_methods = [method for method in methods if method in agents]
+    if not selected_methods:
+        raise ValueError(f"No supported baseline methods selected: {methods}")
+
     raw_items_by_user = build_item_ids_by_user(raw_recs)
-    raw_constraints = evaluate_capacity_constraints(raw_recs)
+    raw_constraints = evaluate_capacity_constraints(raw_recs, capacity_col=capacity_col, consumption_col=consumption_col)
     raw_capacity_rate = float(raw_constraints.get("capacity_satisfaction_rate", 0.0))
     raw_capacity_violation = float(raw_constraints.get("capacity_violation_total", 0.0))
     raw_over_capacity_count = int(raw_constraints.get("over_capacity_item_count", 0))
     raw_fully_repaired = bool(raw_constraints.get("all_hard_constraints_satisfied", False))
+    raw_dynamic_diagnostics: Dict[str, Any] = {}
+    if consumption_col:
+        raw_dynamic_diagnostics, _ = replay_dynamic_inventory(
+            raw_recs,
+            user_order,
+            capacity_col=capacity_col,
+            consumption_col=consumption_col,
+        )
+        inventory_summary = dict(inventory_summary)
+        inventory_summary.update(
+            {
+                "strategy": strategy,
+                "raw_dynamic_violation_total": float(raw_dynamic_diagnostics.get("dynamic_violation_total", 0.0)),
+                "raw_dynamic_capacity_satisfied": bool(raw_dynamic_diagnostics.get("dynamic_capacity_satisfied", False)),
+            }
+        )
 
     raw_accuracy: Dict[str, Tuple[float, float]] = {}
     for info in user_rows:
@@ -1699,6 +2021,16 @@ def run_reranking_evaluation(
         agent_max_overflow = float(final_constraints.get("max_capacity_overflow", 0.0))
         agent_mean_utilization = float(final_constraints.get("mean_item_utilization", 0.0))
         final_items_by_user = build_item_ids_by_user(recommendations)
+        dynamic_diagnostics: Dict[str, Any] = {}
+        dynamic_user_stats: Dict[str, Dict[str, float]] = {}
+        if consumption_col:
+            dynamic_diagnostics, dynamic_user_stats = replay_dynamic_inventory(
+                recommendations,
+                user_order,
+                capacity_col=capacity_col,
+                consumption_col=consumption_col,
+            )
+            diagnostics["dynamic_service_stats"] = dynamic_diagnostics
 
         final_counts = (
             recommendations["user_id"].astype(str).value_counts().astype(int).to_dict()
@@ -1747,11 +2079,19 @@ def run_reranking_evaluation(
                     changed_item_count=int(max(len(raw_item_set), len(final_item_set)) - overlap_count),
                     final_hit_at_10=float(final_hr),
                     final_ndcg_at_10=float(final_ndcg),
+                    expected_consumption_sum=float(
+                        dynamic_user_stats.get(user_id, {}).get("expected_consumption_sum", 0.0)
+                    ),
+                    stockout_event=bool(dynamic_user_stats.get(user_id, {}).get("stockout_event", 0.0)),
+                    remaining_inventory_after_user=float(
+                        dynamic_user_stats.get(user_id, {}).get("remaining_inventory_after_user", 0.0)
+                    ),
+                    service_position=int(dynamic_user_stats.get(user_id, {}).get("service_position", 0.0)),
                     raw_item_ids=raw_items,
                     final_item_ids=final_items,
                 )
             )
-    return records
+    return records, inventory_summary, inventory_item_stats
 
 
 def run_recall_only_evaluation(
@@ -1846,6 +2186,10 @@ def _mean_dict(records: List[EvalRecord]) -> Dict[str, float]:
         "changed_item_count",
         "final_hit_at_10",
         "final_ndcg_at_10",
+        "expected_consumption_sum",
+        "stockout_event",
+        "remaining_inventory_after_user",
+        "service_position",
     ]
     return {key: float(np.mean([getattr(record, key) for record in records])) for key in keys}
 
@@ -2011,6 +2355,16 @@ def data_stats_csv_path(output_json: str) -> Path:
     return output_path.with_name(f"{output_path.stem}_data_stats.csv")
 
 
+def inventory_stats_csv_path(output_json: str) -> Path:
+    output_path = Path(output_json)
+    return output_path.with_name(f"{output_path.stem}_inventory_stats.csv")
+
+
+def protocol_summary_csv_path(output_json: str) -> Path:
+    output_path = Path(output_json)
+    return output_path.with_name(f"{output_path.stem}_protocol_summary.csv")
+
+
 def save_data_stats_csv(output_json: str, data_stats: Sequence[Mapping[str, Any]]) -> None:
     if not data_stats:
         return
@@ -2018,6 +2372,29 @@ def save_data_stats_csv(output_json: str, data_stats: Sequence[Mapping[str, Any]
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(list(data_stats)).to_csv(path, index=False)
     LOGGER.info("Saved scenario-1 data stats CSV: %s", path)
+
+
+def save_inventory_stats_csv(output_json: str, inventory_stats: pd.DataFrame) -> None:
+    if inventory_stats.empty:
+        return
+    path = inventory_stats_csv_path(output_json)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    inventory_stats.to_csv(path, index=False)
+    LOGGER.info("Saved scenario-1 inventory stats CSV: %s", path)
+
+
+def save_protocol_summary_csv(output_json: str, summaries: Mapping[str, Mapping[str, Any]]) -> None:
+    if not summaries:
+        return
+    path = protocol_summary_csv_path(output_json)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for key, row in summaries.items():
+        out = dict(row)
+        out.setdefault("method_strategy", key)
+        rows.append(out)
+    pd.DataFrame(rows).to_csv(path, index=False)
+    LOGGER.info("Saved scenario-1 protocol summary CSV: %s", path)
 
 
 def save_metrics_json(
@@ -2030,6 +2407,7 @@ def save_metrics_json(
     completed_strategies: Optional[Sequence[str]] = None,
     diagnostics: Optional[Dict[str, Any]] = None,
     data_stats: Optional[Sequence[Mapping[str, Any]]] = None,
+    inventory_stats: Optional[pd.DataFrame] = None,
 ) -> None:
     """Persist per-user records and aggregate summary for plotting."""
     output_path = Path(output_json)
@@ -2042,6 +2420,7 @@ def save_metrics_json(
         "completed_strategies": list(completed_strategies or summaries_by_strategy.keys()),
         "diagnostics": diagnostics or {},
         "data_stats": list(data_stats or []),
+        "inventory_stats": inventory_stats.to_dict(orient="records") if inventory_stats is not None and not inventory_stats.empty else [],
         "records": [asdict(record) for record in records],
     }
     with output_path.open("w", encoding="utf-8") as f:
@@ -2049,6 +2428,10 @@ def save_metrics_json(
     LOGGER.info("Saved scenario-1 metrics JSON: %s", output_path)
     if data_stats:
         save_data_stats_csv(output_json, data_stats)
+    if inventory_stats is not None:
+        save_inventory_stats_csv(output_json, inventory_stats)
+    if summaries_by_method_strategy:
+        save_protocol_summary_csv(output_json, summaries_by_method_strategy)
 
 
 def main() -> None:
@@ -2221,10 +2604,12 @@ def main() -> None:
     summaries_by_strategy: Dict[str, Dict[str, Any]] = {}
     summaries_by_method_strategy: Dict[str, Dict[str, Any]] = {}
     completed_strategies: List[str] = []
+    inventory_stat_frames: List[pd.DataFrame] = []
+    inventory_summaries_by_strategy: Dict[str, Dict[str, Any]] = {}
     for strategy in strategies:
         LOGGER.info("Running scenario-1 recall strategy: %s", strategy)
         strategy_start = time.time()
-        strategy_records = run_reranking_evaluation(
+        strategy_records, inventory_summary, inventory_stats = run_reranking_evaluation(
             strategy=strategy,
             methods=methods,
             model=recall_models.get(strategy),
@@ -2243,7 +2628,35 @@ def main() -> None:
             seed=args.seed,
             recall_backend=args.recall_backend,
             recall_cache=recall_cache,
+            inventory_protocol=args.inventory_protocol,
+            inventory_mechanism=args.inventory_mechanism,
+            inventory_pressure=args.inventory_pressure,
+            expected_orders_per_user=args.expected_orders_per_user,
         )
+        inventory_summaries_by_strategy[strategy] = dict(inventory_summary)
+        if args.inventory_protocol == "dynamic_expected" and inventory_summary:
+            data_stats.append(
+                {
+                    "step": f"inventory_protocol_{strategy}",
+                    "iteration": None,
+                    "rows": None,
+                    "users": int(sampled_test["user_id"].nunique()) if len(sampled_test) else 0,
+                    "items": int(inventory_summary.get("item_count", 0)),
+                    "density": None,
+                    "removed_interactions": 0,
+                    "removed_users": 0,
+                    "removed_items": 0,
+                    "min_user_interactions": args.min_user_interactions,
+                    "min_item_interactions": args.min_item_interactions,
+                    **inventory_summary,
+                }
+            )
+        if not inventory_stats.empty:
+            inventory_stats = inventory_stats.copy()
+            inventory_stats["strategy"] = strategy
+            inventory_stats["inventory_mechanism"] = args.inventory_mechanism
+            inventory_stats["inventory_pressure"] = args.inventory_pressure
+            inventory_stat_frames.append(inventory_stats)
         strategy_method_summaries: Dict[str, Dict[str, Any]] = {}
         for method in methods:
             method_records = [record for record in strategy_records if record.method == method]
@@ -2256,6 +2669,7 @@ def main() -> None:
                 hybrid_bpr_weight=args.hybrid_bpr_weight,
                 recall_backend=args.recall_backend,
             )
+            method_summary.update(inventory_summary)
             strategy_method_summaries[method] = method_summary
             summaries_by_method_strategy[f"{method}::{strategy}"] = method_summary
 
@@ -2286,7 +2700,9 @@ def main() -> None:
             summaries_by_strategy,
             summaries_by_method_strategy=summaries_by_method_strategy,
             completed_strategies=completed_strategies,
+            diagnostics={**model_diagnostics, "inventory_summaries": inventory_summaries_by_strategy},
             data_stats=data_stats,
+            inventory_stats=pd.concat(inventory_stat_frames, ignore_index=True) if inventory_stat_frames else None,
         )
 
     if len(strategies) == 1:
@@ -2321,8 +2737,9 @@ def main() -> None:
         summaries_by_strategy,
         summaries_by_method_strategy=summaries_by_method_strategy,
         completed_strategies=completed_strategies,
-        diagnostics=model_diagnostics,
+        diagnostics={**model_diagnostics, "inventory_summaries": inventory_summaries_by_strategy},
         data_stats=data_stats,
+        inventory_stats=pd.concat(inventory_stat_frames, ignore_index=True) if inventory_stat_frames else None,
     )
 
 
