@@ -1,11 +1,15 @@
 from pathlib import Path
 import sys
+import json
+
 import pandas as pd
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agents import (  # noqa: E402
+    EcommerceDualAgentAgent,
+    EcommerceDualAgentConfig,
     EcommerceInProcessingAgent,
     EcommerceInProcessingConfig,
     EcommerceOnlineGreedyAgent,
@@ -24,6 +28,7 @@ from run_scenario1_baselines import (  # noqa: E402
     sample_test_users,
     temporal_train_test_split,
 )
+from evaluation.plot_results import load_metrics as load_scenario1_plot_metrics  # noqa: E402
 
 
 def test_capacity_diagnostics_counts_overflow() -> None:
@@ -80,6 +85,36 @@ def test_online_greedy_respects_dynamic_expected_inventory() -> None:
 
     assert recs["item_id"].tolist() == ["A", "C"]
     assert result["diagnostics"]["final_constraints"]["capacity_satisfied"] is True
+
+
+def test_dualagent_respects_dynamic_expected_inventory_without_llm() -> None:
+    candidates = pd.DataFrame(
+        [
+            {"user_id": "u1", "item_id": "A", "base_score": 1.0, "inventory_capacity": 1.0, "expected_consumption": 0.7},
+            {"user_id": "u1", "item_id": "B", "base_score": 0.8, "inventory_capacity": 1.0, "expected_consumption": 0.5},
+            {"user_id": "u2", "item_id": "A", "base_score": 1.0, "inventory_capacity": 1.0, "expected_consumption": 0.7},
+            {"user_id": "u2", "item_id": "C", "base_score": 0.7, "inventory_capacity": 1.0, "expected_consumption": 0.4},
+        ]
+    )
+    agent = EcommerceDualAgentAgent(
+        EcommerceDualAgentConfig(
+            top_k=1,
+            capacity_col="inventory_capacity",
+            consumption_col="expected_consumption",
+            population_size=8,
+            max_generations=3,
+            use_llm=False,
+            random_seed=42,
+        )
+    )
+
+    result = agent.recommend_batch(candidates, user_ids=["u1", "u2"], top_k=1)
+    recs = result["recommendations"]
+
+    assert len(recs) == 2
+    assert result["diagnostics"]["final_constraints"]["capacity_satisfied"] is True
+    assert result["diagnostics"]["final_constraints"]["capacity_violation_total"] == 0.0
+    assert recs["item_id"].value_counts().max() == 1
 
 
 def test_dynamic_inventory_protocol_pressure_ordering() -> None:
@@ -271,3 +306,36 @@ def test_data_stats_records_split_coverage_and_sampling_rate() -> None:
     assert stat["test_only_item_count"] == 2
     assert stat["cold_start_unrecallable_rate"] == 1.0
     assert stat["train_item_coverage_rate"] == 0.0
+
+
+def test_scenario1_plot_loader_preserves_dualagent_method_label(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "scenario1_dualagent_metrics.json"
+    payload = {
+        "summary": {"method": "dualagent", "recall_strategy": "bpr", "num_users": 1},
+        "summaries_by_strategy": {},
+        "summaries_by_method_strategy": {
+            "dualagent::bpr": {
+                "method": "dualagent",
+                "strategy": "bpr",
+                "final_hit_at_10": 1.0,
+                "final_ndcg_at_10": 1.0,
+                "fully_repaired": 1.0,
+                "agent_capacity_violation_total": 0.0,
+                "candidate_shortage": 0.0,
+            }
+        },
+        "records": [
+            {
+                "method": "dualagent",
+                "strategy": "bpr",
+                "final_hit_at_10": 1.0,
+                "final_ndcg_at_10": 1.0,
+            }
+        ],
+    }
+    metrics_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    _, summary_df, records_df, _ = load_scenario1_plot_metrics(str(metrics_path))
+
+    assert summary_df["method_strategy"].tolist() == ["DualAgent-BPR"]
+    assert records_df["method_strategy"].tolist() == ["DualAgent-BPR"]

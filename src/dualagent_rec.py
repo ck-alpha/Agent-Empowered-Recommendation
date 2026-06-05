@@ -52,7 +52,7 @@ class DualAgentConfig:
 
     # LLM settings
     use_llm: bool = True
-    llm_model: str = 'qwen2.5:72b'
+    llm_model: str = 'qwen2.5:14b'
     llm_update_frequency: int = 10
 
     # Output settings
@@ -71,7 +71,12 @@ class DualAgentRec:
     4. Adaptive Constraint Handler
     """
 
-    def __init__(self, config: Optional[DualAgentConfig] = None):
+    def __init__(
+        self,
+        config: Optional[DualAgentConfig] = None,
+        objectives_calculator: Optional[Any] = None,
+        constraint_handler: Optional[Any] = None,
+    ):
         """
         Initialize DualAgent-Rec.
 
@@ -79,6 +84,8 @@ class DualAgentRec:
             config: Framework configuration
         """
         self.config = config or DualAgentConfig()
+        self._provided_objectives_calculator = objectives_calculator
+        self._provided_constraint_handler = constraint_handler
 
         # Initialize components
         self._init_agents()
@@ -120,6 +127,10 @@ class DualAgentRec:
 
     def _init_constraint_handler(self):
         """Initialize constraint handler."""
+        if self._provided_constraint_handler is not None:
+            self.constraint_handler = self._provided_constraint_handler
+            return
+
         constraint_config = ConstraintConfig(
             fairness_threshold=self.config.fairness_threshold,
             seller_coverage_threshold=self.config.seller_coverage_threshold,
@@ -129,6 +140,10 @@ class DualAgentRec:
 
     def _init_objectives_calculator(self):
         """Initialize objectives calculator."""
+        if self._provided_objectives_calculator is not None:
+            self.objectives_calculator = self._provided_objectives_calculator
+            return
+
         self.objectives_calculator = ObjectivesCalculator()
 
     def _get_active_individuals(self) -> List[Individual]:

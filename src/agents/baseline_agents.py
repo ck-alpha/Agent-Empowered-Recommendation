@@ -965,6 +965,353 @@ class EcommerceOnlineGreedyAgent(_EcommerceCapacityBase):
 
 
 @dataclass
+class EcommerceDualAgentConfig:
+    """Configuration for scenario-1 DualAgent capacity adapter."""
+
+    top_k: int = 10
+    base_score_col: str = "base_score"
+    capacity_col: str = "inventory_initial"
+    consumption_col: Optional[str] = None
+    candidate_pool_size: int = 50
+    population_size: int = 30
+    max_generations: int = 10
+    crossover_rate: float = 0.9
+    mutation_rate: float = 0.1
+    use_llm: bool = True
+    llm_model: str = "qwen2.5:14b"
+    llm_update_frequency: int = 10
+    random_seed: int = RANDOM_SEED
+
+
+class _EcommerceDualAgentObjectives:
+    """User-local objectives for dynamic inventory-aware DualAgent search."""
+
+    def __init__(
+        self,
+        score_by_item: Mapping[str, float],
+        consumption_by_item: Mapping[str, float],
+        remaining_inventory: Mapping[str, float],
+        top_k: int,
+    ):
+        self.score_by_item = {str(key): float(value) for key, value in score_by_item.items()}
+        self.consumption_by_item = {str(key): float(value) for key, value in consumption_by_item.items()}
+        self.remaining_inventory = {str(key): float(value) for key, value in remaining_inventory.items()}
+        self.top_k = max(1, int(top_k))
+
+    @staticmethod
+    def _position_weighted_score(scores: Sequence[float]) -> float:
+        if not scores:
+            return 0.0
+        values = np.asarray(scores, dtype=float)
+        weights = 1.0 / np.log2(np.arange(2, len(values) + 2, dtype=float))
+        return float(np.sum(values * weights) / max(float(np.sum(weights)), 1e-9))
+
+    def calculate(
+        self,
+        recommended_items: List[str],
+        user_history: List[Dict],
+        item_features: Dict[str, Dict],
+    ) -> List[float]:
+        del user_history, item_features
+        items = [str(item_id) for item_id in recommended_items[: self.top_k]]
+        if not items:
+            return [0.0, 0.0, 0.0]
+
+        scores = [self.score_by_item.get(item_id, 0.0) for item_id in items]
+        utility = self._position_weighted_score(scores)
+
+        safety_scores = []
+        for item_id in items:
+            consumption = max(0.0, float(self.consumption_by_item.get(item_id, 1.0)))
+            remaining = max(0.0, float(self.remaining_inventory.get(item_id, 0.0)))
+            if consumption <= 1e-9:
+                safety_scores.append(1.0)
+            else:
+                safety_scores.append(float(min(1.0, remaining / consumption)))
+        capacity_safety = float(np.mean(safety_scores)) if safety_scores else 0.0
+        fill_ratio = float(min(1.0, len(set(items)) / self.top_k))
+        return [utility, capacity_safety, fill_ratio]
+
+
+class _EcommerceDualAgentConstraint:
+    """Hard per-user stockout constraint against current remaining inventory."""
+
+    def __init__(self, consumption_by_item: Mapping[str, float], remaining_inventory: Mapping[str, float]):
+        self.consumption_by_item = {str(key): float(value) for key, value in consumption_by_item.items()}
+        self.remaining_inventory = {str(key): float(value) for key, value in remaining_inventory.items()}
+        self.epsilon = 0.0
+
+    def calculate_violations(
+        self,
+        recommended_items: List[str],
+        item_features: Dict[str, Dict],
+    ) -> List[float]:
+        del item_features
+        demand: Dict[str, float] = {}
+        for item_id in recommended_items:
+            item_key = str(item_id)
+            demand[item_key] = demand.get(item_key, 0.0) + max(
+                0.0,
+                float(self.consumption_by_item.get(item_key, 1.0)),
+            )
+
+        violation = 0.0
+        for item_id, consumption in demand.items():
+            remaining = max(0.0, float(self.remaining_inventory.get(item_id, 0.0)))
+            violation += max(0.0, float(consumption) - remaining)
+        return [float(violation), 0.0, 0.0]
+
+    def update_epsilon(self, feasibility_rate: float = None) -> None:
+        del feasibility_rate
+        self.epsilon = 0.0
+
+
+class EcommerceDualAgentAgent(_EcommerceCapacityBase):
+    """
+    场景一 DualAgent 适配器。
+
+    按用户服务顺序运行原 DualAgent 搜索，并用当前 remaining inventory
+    评估硬约束。最终输出前会做一次库存可行投影，确保动态 stockout 为 0。
+    """
+
+    def __init__(self, config: Optional[EcommerceDualAgentConfig] = None):
+        self.config = config or EcommerceDualAgentConfig()
+        super().__init__(
+            self.config.top_k,
+            self.config.base_score_col,
+            self.config.capacity_col,
+            self.config.consumption_col,
+        )
+
+    @staticmethod
+    def _position_mismatch_count(left: Sequence[str], right: Sequence[str]) -> int:
+        size = max(len(left), len(right))
+        total = 0
+        for idx in range(size):
+            left_value = left[idx] if idx < len(left) else None
+            right_value = right[idx] if idx < len(right) else None
+            if left_value != right_value:
+                total += 1
+        return int(total)
+
+    def _consumption(self, row: Mapping[str, Any]) -> float:
+        if self.consumption_col:
+            return max(0.0, float(row.get(self.consumption_col, 0.0)))
+        return 1.0
+
+    def _group_payloads(self, group: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, Dict[str, Any]]]:
+        score_by_item: Dict[str, float] = {}
+        consumption_by_item: Dict[str, float] = {}
+        features_by_item: Dict[str, Dict[str, Any]] = {}
+        for _, row in group.iterrows():
+            item_id = str(row["item_id"])
+            record = row.to_dict()
+            score_by_item[item_id] = float(record.get(self.base_score_col, 0.0))
+            consumption_by_item[item_id] = self._consumption(record)
+            features_by_item[item_id] = record
+        return score_by_item, consumption_by_item, features_by_item
+
+    def _select_best_item_ids(
+        self,
+        candidate_ids: List[str],
+        score_by_item: Mapping[str, float],
+        consumption_by_item: Mapping[str, float],
+        remaining: Mapping[str, float],
+        user_id: str,
+    ) -> Tuple[List[str], int]:
+        if not candidate_ids:
+            return [], 0
+
+        from dualagent_rec import DualAgentConfig, DualAgentRec
+
+        digest = hashlib.sha256(
+            f"ecommerce_dualagent:{self.config.random_seed}:{user_id}".encode("utf-8")
+        ).hexdigest()
+        seed = int(digest[:16], 16) % (2**32)
+        random.seed(seed)
+        np.random.seed(seed)
+
+        recommendation_size = min(self.top_k, len(candidate_ids))
+        config = DualAgentConfig(
+            population_size=max(4, int(self.config.population_size)),
+            max_generations=max(1, int(self.config.max_generations)),
+            recommendation_size=recommendation_size,
+            crossover_rate=float(self.config.crossover_rate),
+            mutation_rate=float(self.config.mutation_rate),
+            use_llm=bool(self.config.use_llm),
+            llm_model=str(self.config.llm_model),
+            llm_update_frequency=max(1, int(self.config.llm_update_frequency)),
+            save_history=False,
+        )
+        objectives = _EcommerceDualAgentObjectives(score_by_item, consumption_by_item, remaining, recommendation_size)
+        constraints = _EcommerceDualAgentConstraint(consumption_by_item, remaining)
+        framework = DualAgentRec(
+            config=config,
+            objectives_calculator=objectives,
+            constraint_handler=constraints,
+        )
+        best_solutions, _ = framework.optimize(
+            candidate_items=candidate_ids,
+            user_history=[],
+            item_features={item_id: {} for item_id in candidate_ids},
+            user_profile={"scenario": "ecommerce_inventory", "user_id": str(user_id)},
+        )
+
+        candidates = best_solutions or []
+        if not candidates:
+            balanced = framework.get_recommendation("balanced")
+            candidates = [balanced] if balanced is not None else []
+        if not candidates:
+            return candidate_ids[:recommendation_size], int(config.population_size * config.max_generations)
+
+        def objective_key(ind: Individual) -> Tuple[float, float, float]:
+            violations = constraints.calculate_violations(ind.item_ids, {})
+            violation = float(np.sum(np.maximum(0.0, np.asarray(violations, dtype=float))))
+            scores = objectives.calculate(ind.item_ids, [], {})
+            return (
+                -violation,
+                float(scores[0]),
+                float(np.mean(scores)),
+            )
+
+        best = max(candidates, key=objective_key)
+        search_steps = int(config.population_size * config.max_generations)
+        return [str(item_id) for item_id in best.item_ids[:recommendation_size]], search_steps
+
+    def _project_to_remaining_inventory(
+        self,
+        selected_ids: Sequence[str],
+        full_group: pd.DataFrame,
+        remaining: Dict[str, float],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, float], int]:
+        rows: List[Dict[str, Any]] = []
+        selected: set = set()
+        next_remaining = dict(remaining)
+        by_item = {
+            str(row["item_id"]): row.to_dict()
+            for _, row in full_group.drop_duplicates("item_id", keep="first").iterrows()
+        }
+        search_steps = 0
+
+        def try_add(record: Mapping[str, Any]) -> bool:
+            item_id = str(record["item_id"])
+            if item_id in selected:
+                return False
+            consumption = self._consumption(record)
+            if float(next_remaining.get(item_id, 0.0)) + 1e-9 < consumption:
+                return False
+            out = dict(record)
+            out["item_id"] = item_id
+            rows.append(out)
+            selected.add(item_id)
+            next_remaining[item_id] = float(next_remaining.get(item_id, 0.0)) - consumption
+            return True
+
+        for item_id in selected_ids:
+            record = by_item.get(str(item_id))
+            if record is None:
+                continue
+            search_steps += 1
+            try_add(record)
+            if len(rows) >= self.top_k:
+                break
+
+        if len(rows) < self.top_k:
+            for _, row in full_group.iterrows():
+                search_steps += 1
+                try_add(row.to_dict())
+                if len(rows) >= self.top_k:
+                    break
+
+        return rows, next_remaining, int(search_steps)
+
+    def recommend_batch(
+        self,
+        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
+        user_ids: Optional[Sequence[str]] = None,
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if top_k is not None:
+            self.top_k = max(0, int(top_k))
+        candidates = self._prepare_candidates(candidate_items)
+        users = self._candidate_order(candidates, user_ids)
+        diagnostics: Dict[str, Any] = {
+            "input_candidate_count": int(len(candidates)),
+            "user_count": int(len(users)),
+            "requested_top_k": int(self.top_k),
+            "num_swaps": 0,
+            "search_steps": 0,
+        }
+        if candidates.empty or not users or self.top_k == 0:
+            return self._empty_result(candidates, diagnostics)
+
+        raw_topk = self._initial_topk(candidates, users)
+        diagnostics["initial_constraints"] = self._compact_constraints(self.constraint_handler.evaluate_all(raw_topk))
+
+        remaining = {str(item_id): float(capacity) for item_id, capacity in self._capacity_map(candidates).items()}
+        candidate_groups = {
+            str(user_id): group.reset_index(drop=True)
+            for user_id, group in candidates.groupby("user_id", sort=False)
+        }
+        rows: List[Dict[str, Any]] = []
+        user_remaining_after: Dict[str, float] = {}
+        for user_id in users:
+            group = candidate_groups.get(str(user_id))
+            if group is None or group.empty:
+                user_remaining_after[str(user_id)] = float(sum(max(0.0, value) for value in remaining.values()))
+                continue
+
+            pool = group.head(max(1, int(self.config.candidate_pool_size))).copy()
+            score_by_item, consumption_by_item, _ = self._group_payloads(pool)
+            selected_ids, optimize_steps = self._select_best_item_ids(
+                candidate_ids=pool["item_id"].astype(str).tolist(),
+                score_by_item=score_by_item,
+                consumption_by_item=consumption_by_item,
+                remaining=remaining,
+                user_id=str(user_id),
+            )
+            projected, remaining, projection_steps = self._project_to_remaining_inventory(
+                selected_ids=selected_ids,
+                full_group=group,
+                remaining=remaining,
+            )
+            for row in projected:
+                out = dict(row)
+                out["user_id"] = str(user_id)
+                rows.append(out)
+            diagnostics["search_steps"] += int(optimize_steps + projection_steps)
+            user_remaining_after[str(user_id)] = float(sum(max(0.0, value) for value in remaining.values()))
+
+        if rows:
+            recs = pd.DataFrame(rows)
+        else:
+            recs = candidates.head(0).copy()
+        recs = self._rerank(recs)
+
+        raw_lists = {
+            str(user_id): group.sort_values("rank")["item_id"].astype(str).tolist()
+            for user_id, group in raw_topk.groupby("user_id", sort=False)
+        }
+        final_lists = {
+            str(user_id): group.sort_values("rank")["item_id"].astype(str).tolist()
+            for user_id, group in recs.groupby("user_id", sort=False)
+        }
+        diagnostics["num_swaps"] = int(
+            sum(self._position_mismatch_count(raw_lists.get(str(user_id), []), final_lists.get(str(user_id), [])) for user_id in users)
+        )
+
+        final_constraints = self.constraint_handler.evaluate_all(recs)
+        diagnostics["final_constraints"] = self._compact_constraints(final_constraints)
+        diagnostics["fully_repaired"] = bool(final_constraints.get("all_hard_constraints_satisfied", False))
+        diagnostics["candidate_shortage_rate"] = self._candidate_shortage_rate(recs, users)
+        diagnostics["final_utility"] = self._utility(recs)
+        diagnostics["remaining_inventory_total"] = float(sum(max(0.0, value) for value in remaining.values()))
+        diagnostics["depleted_item_count"] = int(sum(1 for value in remaining.values() if value <= 1e-9))
+        diagnostics["remaining_inventory_after_user"] = user_remaining_after
+        return {"recommendations": recs, "diagnostics": diagnostics}
+
+
+@dataclass
 class EcommerceInProcessingConfig:
     """Configuration for scenario-1 capacity-only in-processing baseline."""
 

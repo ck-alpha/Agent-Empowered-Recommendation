@@ -57,6 +57,8 @@ except ImportError:  # pragma: no cover - exercised only when optional dependenc
 sys.path.insert(0, os.path.dirname(__file__))
 
 from agents import (
+    EcommerceDualAgentAgent,
+    EcommerceDualAgentConfig,
     EcommerceInProcessingAgent,
     EcommerceInProcessingConfig,
     EcommerceOnlineGreedyAgent,
@@ -240,10 +242,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hybrid_bpr_weight", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument(
         "--baseline_mode",
-        choices=["postprocessing", "inprocessing", "online_greedy", "both", "all"],
+        choices=["postprocessing", "inprocessing", "online_greedy", "dualagent", "both", "all"],
         default="both",
         help="Constrained baseline layer to evaluate.",
     )
+    parser.add_argument("--dualagent_population_size", type=int, default=30, help="Scenario-1 DualAgent population size.")
+    parser.add_argument("--dualagent_max_generations", type=int, default=10, help="Scenario-1 DualAgent generations per served user.")
+    parser.add_argument("--dualagent_candidate_pool_size", type=int, default=50, help="Scenario-1 DualAgent per-user candidate pool size.")
+    parser.add_argument("--dualagent_llm_model", default="qwen2.5:14b", help="Ollama model for Scenario-1 DualAgent coordination.")
+    parser.add_argument("--dualagent_llm_update_frequency", type=int, default=10, help="Scenario-1 DualAgent LLM update frequency.")
+    parser.add_argument("--no_dualagent_llm", action="store_true", help="Disable LLM coordination for Scenario-1 DualAgent.")
     parser.add_argument(
         "--inventory_protocol",
         choices=["legacy_static", "dynamic_expected"],
@@ -287,7 +295,7 @@ def resolve_methods(baseline_mode: str) -> List[str]:
     if baseline_mode == "both":
         return ["postprocessing", "inprocessing"]
     if baseline_mode == "all":
-        return ["postprocessing", "inprocessing", "online_greedy"]
+        return ["postprocessing", "inprocessing", "online_greedy", "dualagent"]
     return [baseline_mode]
 
 
@@ -1858,6 +1866,12 @@ def run_reranking_evaluation(
     inventory_mechanism: str = "demand_aligned",
     inventory_pressure: str = "medium",
     expected_orders_per_user: float = 1.0,
+    dualagent_population_size: int = 30,
+    dualagent_max_generations: int = 10,
+    dualagent_candidate_pool_size: int = 50,
+    dualagent_llm_model: str = "qwen2.5:14b",
+    dualagent_llm_update_frequency: int = 10,
+    dualagent_use_llm: bool = True,
 ) -> Tuple[List[EvalRecord], Dict[str, Any], pd.DataFrame]:
     """Run recall and batch-level capacity-only processing baselines for sampled users."""
     del users
@@ -1971,6 +1985,20 @@ def run_reranking_evaluation(
         ),
         "online_greedy": EcommerceOnlineGreedyAgent(
             EcommerceOnlineGreedyConfig(top_k=top_k, capacity_col=capacity_col, consumption_col=consumption_col or "expected_consumption")
+        ),
+        "dualagent": EcommerceDualAgentAgent(
+            EcommerceDualAgentConfig(
+                top_k=top_k,
+                capacity_col=capacity_col,
+                consumption_col=consumption_col,
+                candidate_pool_size=dualagent_candidate_pool_size,
+                population_size=dualagent_population_size,
+                max_generations=dualagent_max_generations,
+                use_llm=dualagent_use_llm,
+                llm_model=dualagent_llm_model,
+                llm_update_frequency=dualagent_llm_update_frequency,
+                random_seed=seed,
+            )
         ),
     }
     selected_methods = [method for method in methods if method in agents]
@@ -2632,6 +2660,12 @@ def main() -> None:
             inventory_mechanism=args.inventory_mechanism,
             inventory_pressure=args.inventory_pressure,
             expected_orders_per_user=args.expected_orders_per_user,
+            dualagent_population_size=args.dualagent_population_size,
+            dualagent_max_generations=args.dualagent_max_generations,
+            dualagent_candidate_pool_size=args.dualagent_candidate_pool_size,
+            dualagent_llm_model=args.dualagent_llm_model,
+            dualagent_llm_update_frequency=args.dualagent_llm_update_frequency,
+            dualagent_use_llm=not args.no_dualagent_llm,
         )
         inventory_summaries_by_strategy[strategy] = dict(inventory_summary)
         if args.inventory_protocol == "dynamic_expected" and inventory_summary:

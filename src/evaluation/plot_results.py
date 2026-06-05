@@ -25,12 +25,13 @@ import seaborn as sns
 LOGGER = logging.getLogger(__name__)
 STRATEGY_ORDER = ["bpr", "item_knn", "pop"]
 STRATEGY_LABELS = {"bpr": "BPR", "item_knn": "Item-KNN", "pop": "Popularity"}
-METHOD_ORDER = ["recall_only", "postprocessing", "inprocessing", "online_greedy"]
+METHOD_ORDER = ["recall_only", "postprocessing", "inprocessing", "online_greedy", "dualagent"]
 METHOD_LABELS = {
     "recall_only": "Recall",
     "postprocessing": "Post",
     "inprocessing": "In",
     "online_greedy": "Online",
+    "dualagent": "DualAgent",
 }
 
 

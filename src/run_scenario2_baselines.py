@@ -35,6 +35,8 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(__file__))
 
 from agents.news_baseline_agents import (  # noqa: E402
+    NewsDualAgentAgent,
+    NewsDualAgentConfig,
     NewsInProcessingAgent,
     NewsInProcessingConfig,
     NewsPostProcessingAgent,
@@ -47,7 +49,7 @@ from constraints.news_constraint_handler import NewsConstraintConfig, NewsConstr
 LOGGER = logging.getLogger(__name__)
 RANDOM_SEED = 42
 EPS = 1e-9
-METHODS = ["raw_ranker", "postprocessing", "inprocessing"]
+METHODS = ["raw_ranker", "postprocessing", "inprocessing", "dualagent"]
 
 
 @dataclass
@@ -108,6 +110,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target_topic_entropy", type=float, default=1.1)
     parser.add_argument("--lambda_diversity", type=float, default=1.0)
     parser.add_argument("--rho_diversity", type=float, default=1.0)
+    parser.add_argument("--dualagent_population_size", type=int, default=30, help="Scenario-2 DualAgent population size.")
+    parser.add_argument("--dualagent_max_generations", type=int, default=10, help="Scenario-2 DualAgent generations per impression.")
+    parser.add_argument("--dualagent_llm_model", default="qwen2.5:14b", help="Ollama model for Scenario-2 DualAgent coordination.")
+    parser.add_argument("--dualagent_llm_update_frequency", type=int, default=10, help="Scenario-2 DualAgent LLM update frequency.")
+    parser.add_argument("--no_dualagent_llm", action="store_true", help="Disable LLM coordination for Scenario-2 DualAgent.")
     return parser.parse_args()
 
 
@@ -413,6 +420,17 @@ def make_agents(args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "postprocessing": NewsPostProcessingAgent(NewsPostProcessingConfig(**common)),
         "inprocessing": NewsInProcessingAgent(NewsInProcessingConfig(**common, random_seed=args.seed)),
+        "dualagent": NewsDualAgentAgent(
+            NewsDualAgentConfig(
+                **common,
+                population_size=args.dualagent_population_size,
+                max_generations=args.dualagent_max_generations,
+                use_llm=not args.no_dualagent_llm,
+                llm_model=args.dualagent_llm_model,
+                llm_update_frequency=args.dualagent_llm_update_frequency,
+                random_seed=args.seed,
+            )
+        ),
     }
 
 

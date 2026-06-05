@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CoordinatorConfig:
     """Configuration for LLM Coordinator."""
-    model_name: str = 'qwen2.5:72b'
+    model_name: str = 'qwen2.5:14b'
     temperature: float = 0.1
     update_frequency: int = 10  # Update every N generations
     use_llm: bool = True  # Can disable LLM for ablation study

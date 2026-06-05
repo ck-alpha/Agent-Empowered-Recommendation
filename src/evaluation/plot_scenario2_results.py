@@ -24,11 +24,12 @@ import seaborn as sns
 
 
 LOGGER = logging.getLogger(__name__)
-METHOD_ORDER = ["raw_ranker", "postprocessing", "inprocessing"]
+METHOD_ORDER = ["raw_ranker", "postprocessing", "inprocessing", "dualagent"]
 METHOD_LABELS = {
     "raw_ranker": "Raw",
     "postprocessing": "Post",
     "inprocessing": "In",
+    "dualagent": "DualAgent",
 }
 
 

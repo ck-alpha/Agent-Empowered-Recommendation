@@ -6,6 +6,8 @@ from .base_agent import BaseAgent, Individual
 from .exploitation_agent import ExploitationAgent
 from .exploration_agent import ExplorationAgent
 from .baseline_agents import (
+    EcommerceDualAgentAgent,
+    EcommerceDualAgentConfig,
     EcommerceInProcessingAgent,
     EcommerceInProcessingConfig,
     EcommerceOnlineGreedyAgent,
@@ -18,6 +20,8 @@ from .baseline_agents import (
     WeightedSumInProcessingBaseline,
 )
 from .news_baseline_agents import (
+    NewsDualAgentAgent,
+    NewsDualAgentConfig,
     NewsInProcessingAgent,
     NewsInProcessingConfig,
     NewsPostProcessingAgent,
@@ -29,6 +33,8 @@ __all__ = [
     'Individual',
     'ExploitationAgent',
     'ExplorationAgent',
+    'EcommerceDualAgentAgent',
+    'EcommerceDualAgentConfig',
     'EcommerceInProcessingAgent',
     'EcommerceInProcessingConfig',
     'EcommerceOnlineGreedyAgent',
@@ -39,6 +45,8 @@ __all__ = [
     'WeightedSumInProcessingBaseline',
     'GreedyRerankConfig',
     'GreedyRerankingBaseline',
+    'NewsDualAgentAgent',
+    'NewsDualAgentConfig',
     'NewsInProcessingAgent',
     'NewsInProcessingConfig',
     'NewsPostProcessingAgent',

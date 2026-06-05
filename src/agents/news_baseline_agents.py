@@ -8,8 +8,10 @@ contain ``news_id``, a topic column (``category`` by default), and a ranker
 
 from __future__ import annotations
 
+import hashlib
+import random
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -42,6 +44,26 @@ class NewsInProcessingConfig:
     target_topic_entropy: float = 1.1
     lambda_diversity: float = 1.0
     rho_diversity: float = 1.0
+    random_seed: int = RANDOM_SEED
+
+
+@dataclass
+class NewsDualAgentConfig:
+    """Configuration for scenario-2 DualAgent news adapter."""
+
+    top_k: int = 10
+    base_score_col: str = "base_score"
+    topic_col: str = "category"
+    target_topic_entropy: float = 1.1
+    lambda_diversity: float = 1.0
+    rho_diversity: float = 1.0
+    population_size: int = 30
+    max_generations: int = 10
+    crossover_rate: float = 0.9
+    mutation_rate: float = 0.1
+    use_llm: bool = True
+    llm_model: str = "qwen2.5:14b"
+    llm_update_frequency: int = 10
     random_seed: int = RANDOM_SEED
 
 
@@ -175,6 +197,248 @@ class _NewsBase:
             "final_objective": 0.0,
         }
         return {"recommendations": empty, "item_ids": [], "diagnostics": diagnostics}
+
+
+class _NewsDualAgentObjectives:
+    """Slate utility and topic-entropy objectives for news DualAgent search."""
+
+    def __init__(
+        self,
+        records_by_item: Mapping[str, Mapping[str, Any]],
+        base_score_col: str,
+        topic_col: str,
+        constraint_handler: NewsConstraintHandler,
+        top_k: int,
+    ):
+        self.records_by_item = {
+            str(item_id): dict(record)
+            for item_id, record in records_by_item.items()
+        }
+        self.base_score_col = str(base_score_col)
+        self.topic_col = str(topic_col)
+        self.constraint_handler = constraint_handler
+        self.top_k = max(1, int(top_k))
+
+    def _ordered_records(self, item_ids: Sequence[str]) -> List[Dict[str, Any]]:
+        seen = set()
+        records: List[Dict[str, Any]] = []
+        for item_id in item_ids:
+            item_key = str(item_id)
+            if item_key in seen or item_key not in self.records_by_item:
+                continue
+            seen.add(item_key)
+            records.append(dict(self.records_by_item[item_key]))
+            if len(records) >= self.top_k:
+                break
+        records.sort(key=lambda row: (-float(row.get(self.base_score_col, 0.0)), str(row.get("news_id", ""))))
+        return records
+
+    @staticmethod
+    def _weighted_utility(scores: Sequence[float]) -> float:
+        if not scores:
+            return 0.0
+        values = np.asarray(scores, dtype=float)
+        weights = _position_weights(len(values))
+        return float(np.sum(values * weights) / max(float(np.sum(weights)), 1e-9))
+
+    def calculate(
+        self,
+        recommended_items: List[str],
+        user_history: List[Dict],
+        item_features: Dict[str, Dict],
+    ) -> List[float]:
+        del user_history, item_features
+        records = self._ordered_records(recommended_items)
+        if not records:
+            return [0.0, 0.0, 0.0]
+
+        scores = [float(row.get(self.base_score_col, 0.0)) for row in records]
+        utility = self._weighted_utility(scores)
+        topics = [str(row.get(self.topic_col, "unknown")) for row in records]
+        counts = pd.Series(topics).value_counts().astype(int).to_dict()
+        entropy = NewsConstraintHandler.entropy_from_counts(counts, len(records))
+        entropy_norm = float(entropy / max(np.log(max(2, len(records))), 1e-9))
+        diversity_penalty = self.constraint_handler.diversity_penalty_from_entropy(entropy)
+        alm_penalty = self.constraint_handler.augmented_lagrangian_penalty(diversity_penalty)
+        penalty_score = float(1.0 / (1.0 + max(0.0, alm_penalty)))
+        return [float(utility), entropy_norm, penalty_score]
+
+
+class _NewsDualAgentSoftConstraint:
+    """No hard news constraints; topic diversity is optimized as a soft objective."""
+
+    epsilon = 0.0
+
+    def calculate_violations(
+        self,
+        recommended_items: List[str],
+        item_features: Dict[str, Dict],
+    ) -> List[float]:
+        del recommended_items, item_features
+        return [0.0, 0.0, 0.0]
+
+    def update_epsilon(self, feasibility_rate: float = None) -> None:
+        del feasibility_rate
+        self.epsilon = 0.0
+
+
+class NewsDualAgentAgent(_NewsBase):
+    """
+    场景二 DualAgent 适配器。
+
+    DualAgent 负责从一个 impression 的候选新闻中搜索 slate；最终用
+    utility - ALM(topic entropy penalty) 在 Pareto 解中选择输出。
+    """
+
+    def __init__(self, config: Optional[NewsDualAgentConfig] = None):
+        self.config = config or NewsDualAgentConfig()
+        handler = build_news_constraint_handler(
+            topic_col=self.config.topic_col,
+            target_topic_entropy=self.config.target_topic_entropy,
+            lambda_diversity=self.config.lambda_diversity,
+            rho_diversity=self.config.rho_diversity,
+        )
+        super().__init__(self.config.top_k, self.config.base_score_col, self.config.topic_col, handler)
+
+    def _records_by_item(self, prepared: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+        return {
+            str(row["news_id"]): row.to_dict()
+            for _, row in prepared.drop_duplicates("news_id", keep="first").iterrows()
+        }
+
+    def _materialize_slate(
+        self,
+        item_ids: Sequence[str],
+        prepared: pd.DataFrame,
+        k: int,
+    ) -> pd.DataFrame:
+        records_by_item = self._records_by_item(prepared)
+        rows: List[Dict[str, Any]] = []
+        selected = set()
+        for item_id in item_ids:
+            item_key = str(item_id)
+            if item_key in selected or item_key not in records_by_item:
+                continue
+            rows.append(dict(records_by_item[item_key]))
+            selected.add(item_key)
+            if len(rows) >= k:
+                break
+        if len(rows) < k:
+            for _, row in prepared.iterrows():
+                item_key = str(row["news_id"])
+                if item_key in selected:
+                    continue
+                rows.append(row.to_dict())
+                selected.add(item_key)
+                if len(rows) >= k:
+                    break
+        if not rows:
+            return _with_rank(prepared.head(0).copy())
+        slate = pd.DataFrame(rows).sort_values(
+            [self.base_score_col, "news_id"],
+            ascending=[False, True],
+        )
+        return _with_rank(slate.head(k).reset_index(drop=True))
+
+    def _final_objective(self, slate: pd.DataFrame) -> Tuple[float, float, float, str]:
+        constraints = self.constraint_handler.evaluate_all(slate)
+        utility = self._position_weighted_utility(slate)
+        penalty = float(constraints.get("augmented_lagrangian_penalty", 0.0))
+        entropy = float(constraints.get("topic_entropy", 0.0))
+        signature = _stable_signature(slate["news_id"].astype(str).tolist()) if not slate.empty else ""
+        return float(utility - penalty), utility, entropy, signature
+
+    def recommend(
+        self,
+        user_id: str,
+        candidate_items: Union[pd.DataFrame, List[Dict[str, Any]]],
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        requested_k = self.top_k if top_k is None else max(0, int(top_k))
+        prepared = self._prepare_candidates(candidate_items)
+        if requested_k == 0 or prepared.empty:
+            return self._empty_result(prepared, user_id, requested_k)
+
+        k = min(requested_k, len(prepared))
+        raw_reference = _with_rank(prepared.head(k).copy())
+        records_by_item = self._records_by_item(prepared)
+        candidate_ids = prepared["news_id"].astype(str).tolist()
+
+        from dualagent_rec import DualAgentConfig, DualAgentRec
+
+        impression_key = str(prepared["impression_id"].iloc[0]) if "impression_id" in prepared.columns else str(user_id)
+        digest = hashlib.sha256(
+            f"news_dualagent:{self.config.random_seed}:{impression_key}".encode("utf-8")
+        ).hexdigest()
+        seed = int(digest[:16], 16) % (2**32)
+        random.seed(seed)
+        np.random.seed(seed)
+
+        config = DualAgentConfig(
+            population_size=max(4, int(self.config.population_size)),
+            max_generations=max(1, int(self.config.max_generations)),
+            recommendation_size=k,
+            crossover_rate=float(self.config.crossover_rate),
+            mutation_rate=float(self.config.mutation_rate),
+            use_llm=bool(self.config.use_llm),
+            llm_model=str(self.config.llm_model),
+            llm_update_frequency=max(1, int(self.config.llm_update_frequency)),
+            save_history=False,
+        )
+        objectives = _NewsDualAgentObjectives(
+            records_by_item=records_by_item,
+            base_score_col=self.base_score_col,
+            topic_col=self.topic_col,
+            constraint_handler=self.constraint_handler,
+            top_k=k,
+        )
+        framework = DualAgentRec(
+            config=config,
+            objectives_calculator=objectives,
+            constraint_handler=_NewsDualAgentSoftConstraint(),
+        )
+        best_solutions, _ = framework.optimize(
+            candidate_items=candidate_ids,
+            user_history=[],
+            item_features={item_id: {} for item_id in candidate_ids},
+            user_profile={"scenario": "news_topic_diversity", "user_id": str(user_id)},
+        )
+
+        candidates = best_solutions or []
+        if not candidates:
+            balanced = framework.get_recommendation("balanced")
+            candidates = [balanced] if balanced is not None else []
+
+        best_slate = raw_reference
+        best_key = self._final_objective(raw_reference)
+        for individual in candidates:
+            if individual is None:
+                continue
+            slate = self._materialize_slate(individual.item_ids, prepared, k)
+            key = self._final_objective(slate)
+            if key[:3] > best_key[:3] or (key[:3] == best_key[:3] and key[3] < best_key[3]):
+                best_key = key
+                best_slate = slate
+
+        recommendations = _with_rank(best_slate.reset_index(drop=True))
+        item_ids = recommendations["news_id"].astype(str).tolist()
+        raw_ids = raw_reference["news_id"].astype(str).tolist()
+        constraints = self.constraint_handler.evaluate_all(recommendations)
+        utility = self._position_weighted_utility(recommendations)
+        diagnostics: Dict[str, Any] = {
+            "user_id": str(user_id),
+            "requested_top_k": int(requested_k),
+            "input_candidate_count": int(len(prepared)),
+            "candidate_shortage": bool(len(recommendations) < requested_k),
+            "initial_constraints": self.constraint_handler.evaluate_all(raw_reference),
+            "final_constraints": constraints,
+            "final_utility": float(utility),
+            "final_objective": float(utility - float(constraints.get("augmented_lagrangian_penalty", 0.0))),
+            "num_swaps": _position_mismatch_count(item_ids, raw_ids),
+            "search_steps": int(config.population_size * config.max_generations),
+            "pareto_size": int(len(best_solutions)),
+        }
+        return {"recommendations": recommendations, "item_ids": item_ids, "diagnostics": diagnostics}
 
 
 class NewsPostProcessingAgent(_NewsBase):

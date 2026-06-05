@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import json
 
 import numpy as np
 import pandas as pd
@@ -8,12 +9,15 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agents import (  # noqa: E402
+    NewsDualAgentAgent,
+    NewsDualAgentConfig,
     NewsInProcessingAgent,
     NewsInProcessingConfig,
     NewsPostProcessingAgent,
     NewsPostProcessingConfig,
 )
 from constraints import NewsConstraintConfig, NewsConstraintHandler  # noqa: E402
+from evaluation.plot_scenario2_results import load_metrics as load_scenario2_plot_metrics  # noqa: E402
 
 
 def test_topic_entropy_penalty_and_alm_are_natural_log() -> None:
@@ -109,6 +113,38 @@ def test_inprocessing_exact_slate_level_optimization_selects_global_topic_counts
     assert result["diagnostics"]["final_constraints"]["entropy_target_satisfied"] is True
 
 
+def test_dualagent_news_adapter_uses_entropy_objective_without_llm() -> None:
+    candidates = pd.DataFrame(
+        [
+            {"news_id": "a1", "category": "a", "base_score": 1.00},
+            {"news_id": "a2", "category": "a", "base_score": 0.99},
+            {"news_id": "a3", "category": "a", "base_score": 0.98},
+            {"news_id": "b1", "category": "b", "base_score": 0.35},
+            {"news_id": "c1", "category": "c", "base_score": 0.34},
+        ]
+    )
+    agent = NewsDualAgentAgent(
+        NewsDualAgentConfig(
+            top_k=3,
+            target_topic_entropy=1.0,
+            lambda_diversity=8.0,
+            rho_diversity=1.0,
+            population_size=12,
+            max_generations=4,
+            use_llm=False,
+            random_seed=42,
+        )
+    )
+
+    result = agent.recommend(user_id="u1", candidate_items=candidates)
+    recs = result["recommendations"]
+
+    assert len(recs) == 3
+    assert recs["category"].nunique() >= 2
+    assert result["diagnostics"]["final_constraints"]["topic_entropy"] > 0.0
+    assert result["diagnostics"]["search_steps"] == 48
+
+
 def test_news_exports_are_available_from_public_packages() -> None:
     assert NewsConstraintHandler is not None
     assert NewsConstraintConfig is not None
@@ -116,3 +152,36 @@ def test_news_exports_are_available_from_public_packages() -> None:
     assert NewsPostProcessingConfig is not None
     assert NewsInProcessingAgent is not None
     assert NewsInProcessingConfig is not None
+    assert NewsDualAgentAgent is not None
+    assert NewsDualAgentConfig is not None
+
+
+def test_scenario2_plot_loader_preserves_dualagent_method_label(tmp_path: Path) -> None:
+    metrics_path = tmp_path / "scenario2_dualagent_metrics.json"
+    payload = {
+        "summary": {"method": "dualagent", "num_records": 1},
+        "summaries_by_method": {
+            "dualagent": {
+                "method": "dualagent",
+                "ndcg_at_10": 1.0,
+                "topic_entropy": 1.0,
+                "diversity_penalty": 0.0,
+            }
+        },
+        "category_exposure_by_method": {"dualagent": {"a": 1}},
+        "records": [
+            {
+                "method": "dualagent",
+                "ndcg_at_10": 1.0,
+                "topic_entropy": 1.0,
+                "diversity_penalty": 0.0,
+            }
+        ],
+    }
+    metrics_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    _, summary_df, records_df, exposure_df = load_scenario2_plot_metrics(str(metrics_path))
+
+    assert summary_df["method_label"].tolist() == ["DualAgent"]
+    assert records_df["method_label"].tolist() == ["DualAgent"]
+    assert exposure_df["method_label"].tolist() == ["DualAgent"]
