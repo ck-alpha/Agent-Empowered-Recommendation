@@ -1,0 +1,128 @@
+"""Typed public contracts for COPA Phase 1."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
+
+
+Direction = Literal["maximize", "minimize"]
+ObjectiveScope = Literal["candidate", "slate"]
+
+
+@dataclass(frozen=True)
+class CandidateRecord:
+    item_id: str
+    base_score: float
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    source: str = "unknown"
+
+    def to_row(self) -> Dict[str, Any]:
+        return {
+            "item_id": str(self.item_id),
+            "base_score": float(self.base_score),
+            "metadata": dict(self.metadata),
+            "hard_state": {"feasible": True, "violations": []},
+            "soft_objectives": {},
+            "active": True,
+            "source": self.source,
+            "version": 0,
+        }
+
+
+@dataclass(frozen=True)
+class ConstraintSpec:
+    id: str
+    type: str
+    attribute: str = "item_id"
+    operator: str = "=="
+    value: Any = None
+    description: str = ""
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ConstraintSpec":
+        return cls(**dict(payload))
+
+
+@dataclass(frozen=True)
+class ObjectiveSpec:
+    name: str
+    direction: Direction = "maximize"
+    scope: ObjectiveScope = "slate"
+    params: Mapping[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ObjectiveSpec":
+        return cls(**dict(payload))
+
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    top_k: int = 10
+    population_size: int = 100
+    generations: int = 50
+    crossover_rate: float = 0.9
+    mutation_rate: float = 0.15
+    tournament_size: int = 2
+    seed: int = 42
+    selection_strategy: Literal["compromise", "weighted"] = "compromise"
+    objective_weights: Optional[Sequence[float]] = None
+
+
+@dataclass
+class SlateSolution:
+    item_ids: List[str]
+    objective_values: Dict[str, float] = field(default_factory=dict)
+    maximization_values: List[float] = field(default_factory=list)
+    rank: int = 0
+    crowding_distance: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class VerificationReport:
+    feasible: bool
+    violations: List[Dict[str, Any]]
+    requested_k: int
+    actual_k: int
+    checked_constraints: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RecommendationRequest:
+    user_id: str
+    candidates: Sequence[CandidateRecord]
+    constraints: Sequence[ConstraintSpec]
+    objectives: Sequence[ObjectiveSpec]
+    optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
+    context: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RecommendationResult:
+    user_id: str
+    item_ids: List[str]
+    objective_values: Dict[str, float]
+    pareto_front: List[SlateSolution]
+    verification: VerificationReport
+    bus_version: int
+    trace_path: Optional[Path]
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "item_ids": self.item_ids,
+            "objective_values": self.objective_values,
+            "pareto_front": [solution.to_dict() for solution in self.pareto_front],
+            "verification": self.verification.to_dict(),
+            "bus_version": self.bus_version,
+            "trace_path": str(self.trace_path) if self.trace_path else None,
+            "diagnostics": self.diagnostics,
+        }
