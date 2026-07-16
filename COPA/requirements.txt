@@ -5,4 +5,6 @@ PyYAML>=6.0
 pyarrow>=10.0
 pydantic>=2.7
 requests>=2.28
+langgraph==1.2.9
+langgraph-checkpoint-sqlite==3.1.0
 pytest>=8.0

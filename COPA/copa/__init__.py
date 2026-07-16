@@ -16,6 +16,7 @@ from .core.verifier import DeterministicVerifier
 from .objectives import ObjectiveRegistry
 from .optimization import ParetoOptimizer
 from .pipeline import COPAPipeline
+from .session import COPAExecutionSession
 from .phase2 import (
     CompileResult,
     ConstraintCompiler,
@@ -26,14 +27,32 @@ from .phase2 import (
     NaturalLanguageRecommendationResult,
     OllamaConfig,
 )
+from .phase3 import (
+    AgentCOPAPipeline,
+    AgentExecutionPlan,
+    AgentGraphConfig,
+    AgentRecommendationRequest,
+    AgentRecommendationResult,
+    AgentToolRegistry,
+    PlannerAgent,
+    RepairAgent,
+    RepairDecision,
+)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "COPAPipeline",
+    "COPAExecutionSession",
     "CandidateRecord",
     "CandidateStateBus",
     "CandidateTracker",
+    "AgentCOPAPipeline",
+    "AgentExecutionPlan",
+    "AgentGraphConfig",
+    "AgentRecommendationRequest",
+    "AgentRecommendationResult",
+    "AgentToolRegistry",
     "CompileResult",
     "ConstraintCompiler",
     "ConstraintIR",
@@ -49,7 +68,10 @@ __all__ = [
     "OllamaConfig",
     "OptimizationConfig",
     "ParetoOptimizer",
+    "PlannerAgent",
     "RecommendationRequest",
     "RecommendationResult",
+    "RepairAgent",
+    "RepairDecision",
     "VerificationReport",
 ]
