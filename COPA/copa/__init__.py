@@ -16,19 +16,37 @@ from .core.verifier import DeterministicVerifier
 from .objectives import ObjectiveRegistry
 from .optimization import ParetoOptimizer
 from .pipeline import COPAPipeline
+from .phase2 import (
+    CompileResult,
+    ConstraintCompiler,
+    ConstraintIR,
+    DomainSchemaRegistry,
+    NaturalLanguageCOPAPipeline,
+    NaturalLanguageRecommendationRequest,
+    NaturalLanguageRecommendationResult,
+    OllamaConfig,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "COPAPipeline",
     "CandidateRecord",
     "CandidateStateBus",
     "CandidateTracker",
+    "CompileResult",
+    "ConstraintCompiler",
+    "ConstraintIR",
+    "DomainSchemaRegistry",
     "ConstraintRegistry",
     "ConstraintSpec",
     "DeterministicVerifier",
     "ObjectiveRegistry",
     "ObjectiveSpec",
+    "NaturalLanguageCOPAPipeline",
+    "NaturalLanguageRecommendationRequest",
+    "NaturalLanguageRecommendationResult",
+    "OllamaConfig",
     "OptimizationConfig",
     "ParetoOptimizer",
     "RecommendationRequest",

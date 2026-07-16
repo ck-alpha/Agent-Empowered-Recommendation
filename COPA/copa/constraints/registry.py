@@ -47,6 +47,7 @@ class ConstraintRegistry:
         self.register("categorical", self._categorical)
         self.register("exclusion", self._exclusion)
         self.register("boolean", self._boolean)
+        self.register("set_membership", self._set_membership)
 
     def register(self, name: str, evaluator: ConstraintEvaluator, *, replace: bool = False) -> None:
         if not name:
@@ -179,3 +180,19 @@ class ConstraintRegistry:
         if operator not in {"==", "!="}:
             raise ValueError(f"Unsupported boolean operator: {operator}")
         return bool(actual == expected) if operator == "==" else bool(actual != expected)
+
+    @staticmethod
+    def _set_membership(actual: Any, operator: str, expected: Any) -> bool:
+        if isinstance(actual, (str, bytes)) or not isinstance(actual, (list, tuple, set, frozenset)):
+            raise TypeError("set_membership requires a collection-valued candidate attribute")
+        expected_values = expected if isinstance(expected, (list, tuple, set, frozenset)) else [expected]
+        if not expected_values:
+            raise ValueError("set_membership expected values cannot be empty")
+        actual_set, expected_set = set(actual), set(expected_values)
+        if operator == "contains_any":
+            return bool(actual_set & expected_set)
+        if operator == "contains_all":
+            return expected_set <= actual_set
+        if operator == "not_contains":
+            return not bool(actual_set & expected_set)
+        raise ValueError(f"Unsupported set_membership operator: {operator}")

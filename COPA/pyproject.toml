@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "copa-recommendation"
+version = "0.2.0"
+description = "Constraint-Oriented Pareto Optimization for deterministic recommendation experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=1.5",
+  "scipy>=1.10",
+  "PyYAML>=6.0",
+  "pyarrow>=10.0",
+  "pydantic>=2.7",
+  "requests>=2.28",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["copa*"]
+
+[tool.setuptools.package-data]
+"copa.phase2" = ["prompts/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

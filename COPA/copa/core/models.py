@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
@@ -79,7 +80,10 @@ class SlateSolution:
     crowding_distance: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if not math.isfinite(float(self.crowding_distance)):
+            payload["crowding_distance"] = None
+        return payload
 
 
 @dataclass(frozen=True)

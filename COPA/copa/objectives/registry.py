@@ -40,8 +40,9 @@ class ObjectiveRegistry:
         if len({spec.name for spec in specs}) != len(specs):
             raise ValueError("Objective names must be unique within one optimization request")
         for spec in specs:
-            if spec.name not in self._evaluators:
-                raise KeyError(f"Unknown objective: {spec.name}")
+            evaluator_name = self._evaluator_name(spec)
+            if evaluator_name not in self._evaluators:
+                raise KeyError(f"Unknown objective: {spec.name} (registry evaluator: {evaluator_name})")
             if spec.direction not in {"maximize", "minimize"}:
                 raise ValueError(f"Unsupported objective direction: {spec.direction}")
             if spec.scope not in {"candidate", "slate"}:
@@ -59,11 +60,17 @@ class ObjectiveRegistry:
         specs = self.validate(specs)
         values: Dict[str, float] = {}
         for spec in specs:
-            value = float(self._evaluators[spec.name](item_ids, frame, spec, context))
+            evaluator_name = self._evaluator_name(spec)
+            value = float(self._evaluators[evaluator_name](item_ids, frame, spec, context))
             if not np.isfinite(value):
                 raise ValueError(f"Objective {spec.name} produced non-finite value: {value}")
             values[spec.name] = value
         return values
+
+    @staticmethod
+    def _evaluator_name(spec: ObjectiveSpec) -> str:
+        """Allow uniquely named objective instances to reuse a registered evaluator."""
+        return str(spec.params.get("registry_name", spec.name))
 
     def to_maximization(self, values: Mapping[str, float], specs: Iterable[ObjectiveSpec]) -> List[float]:
         return [float(values[spec.name]) if spec.direction == "maximize" else -float(values[spec.name]) for spec in specs]
@@ -127,7 +134,13 @@ class ObjectiveRegistry:
                 similarity = float(np.dot(a, b) / denominator) if denominator else 0.0
                 distances.append(float(np.clip(1.0 - similarity, 0.0, 2.0) / 2.0))
             else:
-                distances.append(float(resolve_attribute(left, attribute) != resolve_attribute(right, attribute)))
+                left_value, right_value = resolve_attribute(left, attribute), resolve_attribute(right, attribute)
+                if isinstance(left_value, (list, tuple, set, frozenset)) and isinstance(right_value, (list, tuple, set, frozenset)):
+                    left_set, right_set = set(left_value), set(right_value)
+                    union = left_set | right_set
+                    distances.append(1.0 - len(left_set & right_set) / len(union) if union else 0.0)
+                else:
+                    distances.append(float(left_value != right_value))
         return float(np.mean(distances))
 
     def _novelty(
