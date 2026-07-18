@@ -243,3 +243,8 @@ COPA/configs/smoke.yaml
 !COPA/configs/experiment_b.yaml
 !COPA/configs/experiment_c.yaml
 !COPA/configs/smoke.yaml
+COPA/configs/core_experiment.yaml
+COPA/pyproject.toml
+COPA/docs/COPA_FRAMEWORK_PAPER_REPORT_BILINGUAL.md
+COPA/docs/assets/copa_framework_topconf.png
+COPA/pyproject.toml

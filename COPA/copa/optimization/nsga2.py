@@ -150,6 +150,20 @@ class ParetoOptimizer:
             population = self._environmental_selection(combined, config.population_size)
             if bus.tracker:
                 current_front = non_dominated_sort(population)[0]
+                objective_names = [spec.name for spec in specs]
+                objective_summary = {}
+                if current_front:
+                    objective_matrix = np.asarray(
+                        [solution.maximization_values for solution in current_front],
+                        dtype=float,
+                    )
+                    for index, name in enumerate(objective_names):
+                        values = objective_matrix[:, index]
+                        objective_summary[name] = {
+                            "min": float(np.min(values)),
+                            "median": float(np.median(values)),
+                            "max": float(np.max(values)),
+                        }
                 bus.tracker.record(
                     module="ParetoOptimizationModule",
                     operation="generation",
@@ -160,7 +174,13 @@ class ParetoOptimizer:
                     after_candidates=len(item_pool),
                     duration_ms=(perf_counter() - generation_started) * 1000,
                     seed=config.seed,
-                    input_summary={"generation": generation + 1, "pareto_size": len(current_front)},
+                    input_summary={
+                        "generation": generation + 1,
+                        "pareto_size": len(current_front),
+                        "evaluations": len(memo),
+                        "feasible_candidates": len(item_pool),
+                        "objective_summary": objective_summary,
+                    },
                 )
 
         unique: Dict[Tuple[str, ...], SlateSolution] = {}

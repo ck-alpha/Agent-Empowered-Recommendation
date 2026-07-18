@@ -205,6 +205,8 @@ def evaluate_compiler(
                 "predicted_clarification": predicted_clarification,
                 "attempts": result.attempts,
                 "latency_seconds": result.latency_seconds,
+                "prompt_tokens": int(result.usage.get("prompt_eval_count", 0)),
+                "output_tokens": int(result.usage.get("eval_count", 0)),
                 "issue_codes": ",".join(issue.code for issue in result.issues),
                 "predicted_constraints": json.dumps(predicted_constraints, ensure_ascii=False),
                 "predicted_objectives": json.dumps(predicted_objectives, ensure_ascii=False),
@@ -246,6 +248,10 @@ def evaluate_compiler(
         "retry_rate": float((frame["attempts"] > 1).mean()),
         "latency_p50_seconds": float(frame["latency_seconds"].quantile(0.5)),
         "latency_p95_seconds": float(frame["latency_seconds"].quantile(0.95)),
+        "prompt_tokens": int(frame["prompt_tokens"].sum()),
+        "output_tokens": int(frame["output_tokens"].sum()),
+        "mean_prompt_tokens": float(frame["prompt_tokens"].mean()),
+        "mean_output_tokens": float(frame["output_tokens"].mean()),
         "scenario_metrics": _scenario_summary(frame),
     }
     frame.to_csv(output_dir / "compiler_case_results.csv", index=False)

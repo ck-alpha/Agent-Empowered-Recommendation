@@ -97,6 +97,8 @@ Compiler audit 与 Candidate trace 分离。Compiler audit 只记录 request SHA
 
 结果文件的稳定分组键为 `experiment/method/seed/user_id`。新增指标可增加列，但不要重命名已有指标而不提供迁移说明。
 
+核心论文实验额外固定 `cohort_seed`，优化随机性只由 `seed` 控制。无约束方法仍必须通过原始业务约束做独立严评；`strict_constraint_satisfaction_rate` 不得由训练请求中的空约束集合计算。跨方法 Hypervolume 必须使用共享边界与相同 Sobol seed，不能用每个 front 自己的观测 min-max 作正式比较。
+
 ## 4. 测试与复现检查
 
 修改后至少执行：
@@ -193,3 +195,97 @@ python -m copa.phase3.cli --config configs/phase3_agent.yaml evaluate \
 - checkpoint 是否可以跨 pipeline 实例恢复且权限为 `0600`？
 - Agent trace 是否去重且不包含原始请求和候选 payload？
 - 正常 run 是否禁用 fault injection？
+
+## 8. 2026-07-18 核心实验交接快照
+
+本节是供后续新对话、论文复盘和继续实验使用的当前事实快照。完整结果根目录为：
+
+```text
+COPA/results/copa_core_20260716T174120Z
+```
+
+正式执行已生成 Phase 1 的 2,400 条逐用户记录、Phase 2 的 180 条 run-case 和 Phase 3 的 324 条 mode-run-case。核心实现新增 `run_core.py`、固定权重 `WeightedGeneticOptimizer`、共享边界 Hypervolume/Spacing、严格约束后评估、可恢复 supervisor、资源监控、统计分析与 PNG/PDF 制图。最近一次完整测试为 46 项通过。
+
+### 8.1 Phase 1 当前协议
+
+- 数据：Amazon Reviews'23 All Beauty；按用户时间排序，最后一次交互为 ground truth，其余为训练历史。
+- 队列：`cohort_seed=42` 固定 100 名用户；优化 seeds 为 `42/43/44`。
+- 每用户 100 个候选，Top-10；进化方法 population=100、generations=50。
+- A/Hard-only：`unconstrained_relevance` 对比 `feasible_relevance`。
+- B/Soft-only：`unconstrained_relevance`、等权 `unconstrained_weighted_ga`、`unconstrained_copa`。
+- C/Joint：`feasible_relevance`、`feasible_weighted_ga`、完整 `copa`。
+- 三个优化目标为 relevance、brand diversity、inverse-popularity novelty；正式 All Beauty 不启用 fairness。
+
+All Beauty adapter 当前使用启发式候选分数：
+
+```text
+base_score = 0.65 * popularity
+           + 0.25 * preferred_brand
+           + 0.10 * preferred_category
+```
+
+这三个权重只是确定性工程启发式，当前没有离线调参、学习排序、概率模型或外部文献能够证明 0.65/0.25/0.10 为最优。论文不得把它描述为有理论依据的最优召回器。若保留，必须做权重敏感性分析；更推荐用训练折内的 BPR、矩阵分解、SASRec、双塔或 LambdaMART 产生 `base_score`，COPA 仅消费预计算候选分数。
+
+当前候选池由用户偏好品牌/类别匹配商品、预算内热门商品和全局热门商品合并，先排除训练历史，再按 base score 排序；约 60% 容量留给 relevance-oriented 候选，其余优先补预算内商品。该过程没有显式注入 ground truth，也不保证固定召回率。正式结果的 Candidate Recall 仅为 0.10，Retrieval Loss 为 0.90，因此当前 Phase 1 的首要瓶颈是召回，而不是 Pareto 重排。
+
+### 8.2 当前硬约束及已知有效性问题
+
+每用户三条原始业务约束为：
+
+1. `price_filled <= budget_high`；`budget_high` 当前由用户全部交互商品价格中位数上浮 20% 合成。
+2. `inventory_initial > 0`；库存由流行度、固定系数和高斯噪声合成。
+3. 训练历史 `item_id not_in seen_items`。
+
+必须保留以下限制说明：
+
+- 预算特征在全量 reviews 上生成，可能包含 leave-one-out ground truth 的价格，存在测试信息泄漏风险；应只用训练历史重算。
+- 候选生成器本身使用预算内商品池，使 retrieval 与 constraint filtering 部分耦合。
+- 库存生成器要求 `min_inventory >= 1`，本次数据库存范围为 5--122，所以 `inventory_initial > 0` 恒真，不能作为有效库存约束证据。
+- seen-items 已在候选生成阶段排除，严格后评估中的同名约束主要是防御性不变量。
+- 因而本次 All Beauty 中实质生效的主要是预算约束，统一 violation rate 还会被两条几乎恒真的约束稀释。
+
+库存若无真实补货/销量数据，应明确称为 synthetic stress-test protocol，而不能声称模拟了真实库存。推荐改为可校准的离散时间过程：用训练期交互估计商品需求率及过度离散程度，采用 Poisson/Negative-Binomial demand；给定可解释的 service level、lead time 和 base-stock/reorder policy 生成库存；用低/中/高压力场景报告敏感性。若无法校准这些参数，主论文真实数据实验应删除库存有效性结论，只保留合成故障注入验证。
+
+### 8.3 Phase 1 结果解释边界
+
+- `candidate_recall=0.10`、`retrieval_loss=0.90`、`constraint_filter_loss=0.03`、`target_in_feasible_domain=0.07`。
+- constrained 方法的 ranking loss 约 0.05--0.06，最终 Recall@10 约 0.01--0.02；所有方法 `actual_k_ratio=1` 且无 shortage。
+- 所有 Recall/NDCG 配对比较经 Holm 校正后不显著，不能声称 COPA 提升准确率。
+- COPA 相比 relevance Top-K 提升 novelty 与共享 Hypervolume；固定权重 GA 的 novelty 更高，而 COPA 的优势主要是产生更宽的多目标 trade-off set。
+- `unconstrained_copa` 的最大 relevance 略高于 `copa` 是因为它可以使用预算外候选；它不是合法业务可行域中的公平胜利。完整 COPA 用更小的可行域换取 100% 严格约束满足。
+- COPA 的 Pareto size 在约第 15 代接近 population=100，同时 diversity 几乎恒为 1。这更可能意味着 diversity 饱和和弱支配导致选择压力不足，而不应直接解释为高质量收敛。
+- 当前 convergence 图缺少逐代 shared Hypervolume、selected-compromise 稳定性、跨 seed CI 和早停判据；累计 evaluations 只是预算消耗曲线。
+
+### 8.4 Phase 2/3 评测口径
+
+`Gold` 指人工预先标注且可作为 ground truth 的评测样例，不是训练数据。Phase 2 的 60 条双语 Gold 分为：
+
+- `seen`：Prompt/能力表覆盖的常见单约束或已知表达组合；
+- `compositional`：已知原子能力的新组合；
+- `unseen`：歧义、冲突、未知值、非法范围或安全边界表达；
+- `parsing_exact`：状态、硬约束集合、目标集合和 Top-K 必须同时精确匹配 Gold。
+
+Phase 2 和 Phase 3 正式 Gold 评测都使用 seed=42 的 30 个 synthetic candidates，而不是 All Beauty 用户候选。原因是需要精确计算可行 ID 集合、冲突、shortage 和故障修复真值；它们验证的是 compiler/agent correctness，不是现实推荐效果。
+
+Phase 2 的 `execution_exact` 只在期望状态为 success 的样例上比较预测约束与 Gold 约束产生的完整可行 ID 集合。P50/P95 分别是延迟分布的第 50/95 百分位，不是置信区间。
+
+Phase 3 图表当前用 `status == "success"` 生成 success bar，会把正确的 `clarification_required` 当成未成功。后续主表应以 `status_correct = (status == expected_status)` 作为任务正确率，并分别报告 Slate delivery rate、clarification rate、infrastructure failure rate 和 delivered-slate verifier pass rate。当前 mode comparison 只向 Planner 路径注入 repair fault，`phase2_fixed` 没有面对同一故障，因此 raw quality 不能用于声称 fixed pipeline 优于完整 Agent。
+
+### 8.5 图表、原子性与后续优先级
+
+仅展示框架本体的论文风格图使用：
+
+```text
+COPA/docs/assets/copa_framework_topconf_v2.png
+```
+
+Bus 的“原子提交”是指 updater 先在候选状态副本上完成全部变更与校验；只有全部成功时才一次性把副本发布为新版本。任一字段、约束或数值校验失败时，当前版本完全不变，不会留下半过滤、半更新的候选状态。
+
+后续实验优先级：
+
+1. 修复预算 leave-one-out 泄漏并移除候选生成中的预算耦合。
+2. 接入真实召回模型，同时报告真实 candidate recall 与 oracle-candidate 重排实验。
+3. 删除或重新校准库存生成协议，并报告逐约束违反贡献。
+4. 替换饱和的品牌差异 diversity，增加类别覆盖、熵或 embedding ILD。
+5. 重画逐代 shared HV/selected-slate 曲线，并使用跨用户/seed 置信区间。
+6. 修正 Phase 3 completion 与 McNemar 的 `status_correct` 口径，并对三种模式施加相同故障条件。

@@ -60,6 +60,33 @@ python -m copa.experiments.run_phase1 --config COPA/configs/experiment_c.yaml --
 
 正式配置默认使用现有 `data/processed/beauty_scenario1_*.parquet`，执行 100 用户、3 个 seed、Top-10、100 个候选、100 个个体和 50 代优化。建议先运行 smoke。
 
+### 核心论文实验与自动报告
+
+强化主对比将固定用户队列与优化 seed 解耦，运行 Hard-only、Soft-only、Joint 三组共八个方法单元，并使用原始业务约束进行统一严评：
+
+```bash
+python -m copa.experiments.run_core \
+  --config COPA/configs/core_experiment.yaml \
+  --suite core --workers 4 --cohort-seed 42 \
+  --output-dir COPA/results/core_run --resume
+```
+
+完整三阶段实验由可恢复 supervisor 顺序执行测试、smoke、Phase 1、三次 Phase 2、三次 Phase 3、统计和制图，适合在 tmux 中运行：
+
+```bash
+python -m copa.experiments.supervisor \
+  --output-dir COPA/results/copa_core_TIMESTAMP \
+  --workers 4 --cohort-seed 42 --repeats 3 --resume
+```
+
+仅从已保存原始结果重建统计、PNG/PDF 和中文报告：
+
+```bash
+python -m copa.experiments.analyze_core --input-dir COPA/results/copa_core_TIMESTAMP
+```
+
+supervisor 会保存 `run_manifest.json`、`stage_status.jsonl`、`resource_usage.csv`、逐阶段日志和精确命令。失败后使用同一输出目录及 `--resume`，已完成阶段不会重跑，Phase 1 还会复用逐用户/seed 的原子 checkpoint。
+
 ## Phase 2：Qwen Constraint Compiler
 
 启动本地 Ollama（该服务器的模型目录）：

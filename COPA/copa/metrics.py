@@ -48,6 +48,58 @@ def hypervolume_sobol(front: Sequence[SlateSolution], sample_power: int = 14, se
     return float(np.mean(dominated))
 
 
+def hypervolume_shared(
+    front: Sequence[SlateSolution],
+    *,
+    lower: Sequence[float] | None = None,
+    upper: Sequence[float] | None = None,
+    sample_power: int = 14,
+    seed: int = 42,
+) -> float:
+    """Estimate HV on explicit shared maximization bounds.
+
+    Unlike ``hypervolume_sobol``, this function never derives bounds from one
+    method's observed front, so values are comparable across methods.
+    """
+    if not front:
+        return 0.0
+    values = np.asarray([solution.maximization_values for solution in front], dtype=float)
+    dimensions = values.shape[1]
+    low = np.asarray(lower if lower is not None else np.zeros(dimensions), dtype=float)
+    high = np.asarray(upper if upper is not None else np.ones(dimensions), dtype=float)
+    if low.shape != (dimensions,) or high.shape != (dimensions,):
+        raise ValueError("shared hypervolume bounds must match objective dimensions")
+    if np.any(high <= low):
+        raise ValueError("shared hypervolume upper bounds must exceed lower bounds")
+    normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
+    samples = qmc.Sobol(d=dimensions, scramble=True, seed=seed).random_base2(sample_power)
+    dominated = np.any(
+        np.all(normalized[:, None, :] >= samples[None, :, :], axis=2), axis=0
+    )
+    return float(np.mean(dominated))
+
+
+def spacing_shared(
+    front: Sequence[SlateSolution],
+    *,
+    lower: Sequence[float] | None = None,
+    upper: Sequence[float] | None = None,
+) -> float:
+    """Nearest-neighbour spacing on explicit shared bounds."""
+    if len(front) < 2:
+        return 0.0
+    values = np.asarray([solution.maximization_values for solution in front], dtype=float)
+    dimensions = values.shape[1]
+    low = np.asarray(lower if lower is not None else np.zeros(dimensions), dtype=float)
+    high = np.asarray(upper if upper is not None else np.ones(dimensions), dtype=float)
+    normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
+    minimum_distances = []
+    for index, point in enumerate(normalized):
+        others = np.delete(normalized, index, axis=0)
+        minimum_distances.append(float(np.min(np.linalg.norm(others - point, axis=1))))
+    return float(np.std(minimum_distances))
+
+
 def spacing(front: Sequence[SlateSolution]) -> float:
     values = normalize_front(front)
     if len(values) < 2:
