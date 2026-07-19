@@ -87,6 +87,84 @@ python -m copa.experiments.analyze_core --input-dir COPA/results/copa_core_TIMES
 
 supervisor 会保存 `run_manifest.json`、`stage_status.jsonl`、`resource_usage.csv`、逐阶段日志和精确命令。失败后使用同一输出目录及 `--resume`，已完成阶段不会重跑，Phase 1 还会复用逐用户/seed 的原子 checkpoint。
 
+## 成熟召回层：RecBole BPR、ItemKNN 与 SASRec
+
+正式召回实验自 2026-07-18 起统一使用 `recbole==1.2.1`。仓库原有 PyTorch BPR 是可复现的 legacy 自研基线，不再参与正式方法选择；`src/run_scenario1_baselines.py` 中由 `implicit` 提供的成熟 Item-KNN 变体必须显式命名为 `itemknn_bm25`、`itemknn_tfidf` 或 `itemknn_cosine`，不能与 RecBole ItemKNN 合并报告。SASRec 使用 RecBole 自带的 TransformerEncoder，不需要安装 Hugging Face `transformers`。
+
+安装并校验独立依赖：
+
+```bash
+conda run -n LLM_Rec python -m pip install -r COPA/requirements-retrieval.txt
+conda run -n LLM_Rec python -m pip check
+```
+
+三模型最小训练、full-sort 和 artifact 集成 smoke：
+
+```bash
+cd COPA
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
+  smoke --output-dir results/retrieval_smoke
+```
+
+正式 Beauty/Electronics 去重 5-core、时序 leave-two-out 调参与三 seed 重训（从仓库根目录执行）：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
+  suite --config COPA/configs/retrieval_extension.yaml \
+  --output-dir COPA/results/retrieval_formal --resume
+```
+
+RecBole 的 validation/test 指标覆盖 split 中全部用户；候选导出和后续 COPA 优化使用配置中由 `cohort_seed=42` 固定的 100 用户 cohort，并保存为 `<suite>/<dataset>/export_users.txt`。三种 backend 共用同一目录，报告 artifact 指标时应显式注明 cohort 规模。
+
+suite 还会生成泄漏安全的 `popularity_full_sort.csv`：validation popularity 仅来自 train，test popularity 仅来自 train+validation。它是无调参参考，不会进入三种成熟 backend 的选择或 COPA 端到端矩阵，但即使复杂模型低于该基线也必须保留。
+
+也可以分别执行数据转换与单模型训练：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension prepare \
+  --interactions data/processed/beauty_scenario1_interactions.parquet \
+  --items data/processed/beauty_scenario1_items.parquet \
+  --dataset-name beauty_5core --output-root COPA/results/retrieval_atomic --k-core 5
+
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension train \
+  --data-root COPA/results/retrieval_atomic --dataset-name beauty_5core \
+  --source-interactions data/processed/beauty_scenario1_interactions.parquet \
+  --source-items data/processed/beauty_scenario1_items.parquet \
+  --model sasrec --seed 42 --epochs 100 --stopping-step 10 --candidate-k 500 \
+  --output-dir COPA/results/retrieval_sasrec
+```
+
+对一个候选 artifact 执行真实 K 扫描、Oracle/受控召回以及 COPA 端到端实验：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension evaluate \
+  --manifest COPA/results/retrieval_sasrec/manifest.json \
+  --split COPA/results/retrieval_atomic/beauty_5core/beauty_5core_split.parquet \
+  --items data/processed/beauty_scenario1_items.parquet \
+  --candidate-ks 50,100,200,500 --end-to-end-candidate-k 100 \
+  --optimizer-seeds 42,43,44 --population-size 100 --generations 50 \
+  --interventions --output-dir COPA/results/retrieval_sasrec_evaluation
+```
+
+正式 suite 完成后，一条命令执行全部三 seed 召回扫描、seed-42 三召回器端到端矩阵，以及每个数据集 validation 最优召回器的 Oracle/六档受控敏感性实验：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
+  evaluate-suite --suite-dir COPA/results/retrieval_formal \
+  --workers 4 --resume
+```
+
+端到端任务按用户/条件保存原子 checkpoint；中断后 `--resume` 不会重算签名一致的 population=100、generations=50 优化任务。签名同时绑定受控比例和 intervention seed，改变因果干预配置会安全地使旧 checkpoint 失效。
+
+候选 parquet 的稳定字段为：
+
+```text
+user_id, item_id, raw_score, base_score, retrieval_rank,
+retriever, backend, model_seed
+```
+
+同目录 `manifest.json` 保存 schema、协议、模型配置、环境版本、源数据/独立 split/checkpoint 对应路径和 artifact SHA-256；`targets.parquet` 另存正常模型目标分数、full rank 与 train-catalog coverage。COPA 只读取这些离线文件，不导入 RecBole，也不加载 checkpoint。Loader 会再次校验哈希、ID、有限分数、唯一性、连续 rank、manifest metadata、目标映射、target/candidate 的 rank 与分数一致性，以及 seen-item 排除。
+
 ## Phase 2：Qwen Constraint Compiler
 
 启动本地 Ollama（该服务器的模型目录）：

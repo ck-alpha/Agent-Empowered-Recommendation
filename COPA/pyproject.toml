@@ -23,6 +23,10 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
 experiment = ["matplotlib>=3.7"]
+retrieval = [
+  "recbole==1.2.1",
+  "implicit==0.7.3",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
