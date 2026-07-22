@@ -32,13 +32,16 @@ class RepairConfig:
 class RepairPolicy:
     def validate(self, decision: RepairDecision, violation_codes: Sequence[str]) -> RepairDecision:
         codes = set(violation_codes)
-        if "insufficient_candidates" in codes:
-            allowed = {"request_clarification"}
+        if codes & {"insufficient_candidates", "proven_infeasible"}:
+            allowed = {"request_clarification", "abort"}
+        elif "solver_unknown" in codes:
+            allowed = {"replan", "abort"}
         elif "non_finite_objective" in codes:
             allowed = {"recompute_objectives", "abort"}
         elif codes & {
             "duplicate_items", "unknown_item", "inactive_candidate",
             "hard_constraint_violation", "unexpected_list_length",
+            "slate_constraint_violation", "optimizer_failure",
         }:
             allowed = {"reexecute_selection", "replan", "abort"}
         else:

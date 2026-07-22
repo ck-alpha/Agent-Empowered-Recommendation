@@ -23,6 +23,7 @@ class AttributeCapability:
     executor_type: Optional[str] = None
     parameter_schema: Mapping[str, Any] = field(default_factory=dict)
     description: str = ""
+    slate_aggregations: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ class DomainSchema:
                 "aliases": list(capability.aliases),
                 "value_schema": dict(capability.parameter_schema),
                 "description": capability.description,
+                "slate_aggregations": list(capability.slate_aggregations),
             }
             if capability.kind in {"categorical", "boolean"} and len(values) <= self.enumerate_limit:
                 payload["available_values"] = values
@@ -201,10 +203,10 @@ def synthetic_domain_schema() -> DomainSchema:
     return DomainSchema(
         "synthetic",
         [
-            AttributeCapability("price", "price", "numeric", ("<", "<=", ">", ">=", "==", "!=", "between"), ("价格",), parameter_schema={"type": "number", "currency": "USD"}, description="Candidate price in USD."),
-            AttributeCapability("category", "category", "categorical", ("==", "!=", "in", "not_in"), ("类别", "品类"), parameter_schema={"type": "catalog_value_or_array"}, description="Synthetic product category."),
-            AttributeCapability("brand", "brand_id", "categorical", ("==", "!=", "in", "not_in"), ("brand_id", "品牌"), parameter_schema={"type": "catalog_value_or_array"}, description="Synthetic product brand identifier."),
-            AttributeCapability("group", "group", "categorical", ("==", "!=", "in", "not_in"), ("群体",), parameter_schema={"type": "catalog_value_or_array"}, description="Auditable synthetic group."),
+            AttributeCapability("price", "price", "numeric", ("<", "<=", ">", ">=", "==", "!=", "between"), ("价格",), parameter_schema={"type": "number", "currency": "USD"}, description="Candidate price in USD.", slate_aggregations=("aggregate_sum",)),
+            AttributeCapability("category", "category", "categorical", ("==", "!=", "in", "not_in"), ("类别", "品类"), parameter_schema={"type": "catalog_value_or_array"}, description="Synthetic product category.", slate_aggregations=("distinct_count", "per_group_count", "group_count")),
+            AttributeCapability("brand", "brand_id", "categorical", ("==", "!=", "in", "not_in"), ("brand_id", "品牌"), parameter_schema={"type": "catalog_value_or_array"}, description="Synthetic product brand identifier.", slate_aggregations=("distinct_count", "per_group_count", "group_count")),
+            AttributeCapability("group", "group", "categorical", ("==", "!=", "in", "not_in"), ("群体",), parameter_schema={"type": "catalog_value_or_array"}, description="Auditable synthetic group.", slate_aggregations=("distinct_count", "per_group_count", "group_count")),
             AttributeCapability("popularity", "popularity", "numeric", ("<", "<=", ">", ">=", "between"), ("流行度", "热度"), parameter_schema={"type": "number", "range": [0, 1]}, description="Normalized item popularity."),
             AttributeCapability("availability", "availability", "boolean", ("==", "!="), ("available", "有货", "库存可用"), parameter_schema={"type": "boolean"}, description="Whether the candidate is available."),
             AttributeCapability("item_id", "item_id", "identifier", ("==", "!=", "in", "not_in"), ("商品id", "物品id"), parameter_schema={"type": "catalog_identifier_or_array"}, description="Candidate identifier; only user-supplied exclusions are allowed."),
@@ -223,10 +225,10 @@ def beauty_domain_schema() -> DomainSchema:
     return DomainSchema(
         "all_beauty",
         [
-            AttributeCapability("price", "price_filled", "numeric", ("<", "<=", ">", ">=", "==", "!=", "between"), ("price_filled", "价格"), parameter_schema={"type": "number", "currency": "USD"}, description="Filled Amazon price in USD."),
-            AttributeCapability("category", "main_category", "categorical", ("==", "!=", "in", "not_in"), ("main_category", "类别", "品类"), parameter_schema={"type": "catalog_value_or_array"}, description="Amazon main category."),
-            AttributeCapability("brand", "brand_id", "categorical", ("==", "!=", "in", "not_in"), ("brand_id", "品牌"), parameter_schema={"type": "catalog_value_or_array"}, description="Normalized Amazon brand identifier."),
-            AttributeCapability("seller", "seller_id", "categorical", ("==", "!=", "in", "not_in"), ("seller_id", "卖家"), parameter_schema={"type": "catalog_value_or_array"}, description="Normalized seller identifier."),
+            AttributeCapability("price", "price_filled", "numeric", ("<", "<=", ">", ">=", "==", "!=", "between"), ("price_filled", "价格"), parameter_schema={"type": "number", "currency": "USD"}, description="Filled Amazon price in USD.", slate_aggregations=("aggregate_sum",)),
+            AttributeCapability("category", "main_category", "categorical", ("==", "!=", "in", "not_in"), ("main_category", "类别", "品类"), parameter_schema={"type": "catalog_value_or_array"}, description="Amazon main category.", slate_aggregations=("distinct_count", "per_group_count", "group_count")),
+            AttributeCapability("brand", "brand_id", "categorical", ("==", "!=", "in", "not_in"), ("brand_id", "品牌"), parameter_schema={"type": "catalog_value_or_array"}, description="Normalized Amazon brand identifier.", slate_aggregations=("distinct_count", "per_group_count", "group_count")),
+            AttributeCapability("seller", "seller_id", "categorical", ("==", "!=", "in", "not_in"), ("seller_id", "卖家"), parameter_schema={"type": "catalog_value_or_array"}, description="Normalized seller identifier.", slate_aggregations=("distinct_count", "per_group_count", "group_count")),
             AttributeCapability("popularity", "popularity", "numeric", ("<", "<=", ">", ">=", "between"), ("流行度", "热度"), parameter_schema={"type": "number", "range": [0, 1]}, description="Normalized training-set popularity."),
             AttributeCapability("availability", "inventory_initial", "boolean", ("==", "!="), ("available", "有货", "库存可用"), special_transform="positive_inventory", parameter_schema={"type": "boolean"}, description="Availability derived from inventory_initial > 0."),
             AttributeCapability("item_id", "item_id", "identifier", ("==", "!=", "in", "not_in"), ("商品id", "物品id"), parameter_schema={"type": "catalog_identifier_or_array"}, description="Candidate identifier; only user-supplied exclusions are allowed."),

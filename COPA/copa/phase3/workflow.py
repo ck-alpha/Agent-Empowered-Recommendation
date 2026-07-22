@@ -23,6 +23,7 @@ from copa.core import (
     ObjectiveSpec,
     RecommendationRequest,
     RecommendationResult,
+    SlateConstraintSpec,
     SlateSolution,
     VerificationReport,
 )
@@ -173,7 +174,7 @@ class AgentCOPAPipeline:
                 "request_sha256": hashlib.sha256(request.text.encode("utf-8")).hexdigest(),
                 "candidate_count": len(request.candidates),
                 "system_constraints_sha256": _constraint_fingerprint(
-                    request.to_state_dict()["base_constraints"]
+                    _scoped_constraint_payload(request.to_state_dict())
                 ),
             },
             "candidate_trace_paths": [],
@@ -235,6 +236,7 @@ class AgentCOPAPipeline:
             request.candidates,
             request.base_constraints,
             clarification_answers=answers,
+            base_slate_constraints=request.base_slate_constraints,
         )
         compiled_payload = result.to_dict()
         update: Dict[str, Any] = {
@@ -246,12 +248,18 @@ class AgentCOPAPipeline:
             current = result.plan.to_dict()
             update["compiled_plan"] = current
             expected_system_fingerprint = _constraint_fingerprint(
-                request.to_state_dict()["base_constraints"]
+                _scoped_constraint_payload(request.to_state_dict())
             )
             actual_system_fingerprint = _constraint_fingerprint(
-                entry["spec"]
-                for entry in current.get("constraints", [])
-                if entry.get("provenance") == "system"
+                [
+                    {"scope": scope, **dict(entry["spec"])}
+                    for scope, entries in (
+                        ("item", current.get("constraints", [])),
+                        ("slate", current.get("slate_constraints", [])),
+                    )
+                    for entry in entries
+                    if entry.get("provenance") == "system"
+                ]
             )
             if actual_system_fingerprint != expected_system_fingerprint:
                 update["status"] = "failed"
@@ -388,6 +396,10 @@ class AgentCOPAPipeline:
                 "phase3_thread_id": state["thread_id"],
                 "repair_count": state.get("repair_count", 0),
             },
+            slate_constraints=[
+                SlateConstraintSpec.from_dict(entry["spec"])
+                for entry in compiled.get("slate_constraints", [])
+            ],
         )
         attempt = int(state.get("repair_count", 0))
         run_id = f"phase3_{state['thread_id']}_attempt{attempt}"
@@ -624,6 +636,17 @@ def _constraint_fingerprint(specs: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _scoped_constraint_payload(request_state: Mapping[str, Any]) -> list[Dict[str, Any]]:
+    return [
+        {"scope": scope, **dict(spec)}
+        for scope, key in (
+            ("item", "base_constraints"),
+            ("slate", "base_slate_constraints"),
+        )
+        for spec in request_state.get(key, [])
+    ]
+
+
 def _append_llm_diagnostics(
     diagnostics: Mapping[str, Any], component: str, result: Any
 ) -> Dict[str, Any]:
@@ -658,4 +681,5 @@ def _recommendation_from_dict(payload: Optional[Mapping[str, Any]]) -> Optional[
         bus_version=int(payload.get("bus_version", 0)),
         trace_path=Path(payload["trace_path"]) if payload.get("trace_path") else None,
         diagnostics=dict(payload.get("diagnostics", {})),
+        status=str(payload.get("status", "success")),
     )

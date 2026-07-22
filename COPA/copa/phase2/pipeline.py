@@ -39,6 +39,7 @@ class NaturalLanguageCOPAPipeline:
             domain,
             request.candidates,
             request.base_constraints,
+            base_slate_constraints=request.base_slate_constraints,
         )
         if not compile_result.succeeded:
             return NaturalLanguageRecommendationResult(request.user_id, compile_result, None)
@@ -57,6 +58,7 @@ class NaturalLanguageCOPAPipeline:
             objectives=compile_result.plan.executable_objectives,
             optimization=optimization,
             context=context,
+            slate_constraints=compile_result.plan.executable_slate_constraints,
         )
         recommendation_trace = self.trace_dir / "recommendation" if self.trace_dir else None
         recommendation = COPAPipeline(

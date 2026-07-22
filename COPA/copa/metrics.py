@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, Sequence
+from typing import Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 from scipy.stats import qmc
@@ -26,6 +26,72 @@ def ndcg_at_k(recommended: Sequence[str], relevant: Iterable[str], k: int) -> fl
     return float(dcg / ideal) if ideal else 0.0
 
 
+def constraint_aware_ndcg_at_k(
+    recommended: Sequence[str], relevant: Iterable[str], k: int, opportunity: int
+) -> float:
+    """NDCG normalized by the maximum number of feasible positive hits."""
+
+    if opportunity <= 0:
+        return 0.0
+    relevant_set = set(map(str, relevant))
+    dcg = sum(
+        1.0 / np.log2(rank + 2)
+        for rank, item_id in enumerate(recommended[:k])
+        if str(item_id) in relevant_set
+    )
+    ideal = sum(
+        1.0 / np.log2(rank + 2) for rank in range(min(k, int(opportunity)))
+    )
+    return float(dcg / ideal) if ideal else 0.0
+
+
+def loss_waterfall(
+    *,
+    positives: int,
+    item_feasible: int,
+    model_covered: int,
+    retrieved: int,
+    opportunity: int,
+    hits: int,
+) -> Dict[str, float]:
+    """Return the exclusive five-stage loss decomposition and hit share."""
+
+    counts = {
+        "positives": int(positives),
+        "item_feasible": int(item_feasible),
+        "model_covered": int(model_covered),
+        "retrieved": int(retrieved),
+        "opportunity": int(opportunity),
+        "hits": int(hits),
+    }
+    if counts["positives"] <= 0:
+        raise ValueError("Loss waterfall requires at least one positive")
+    ordered = [
+        counts["positives"],
+        counts["item_feasible"],
+        counts["model_covered"],
+        counts["retrieved"],
+        counts["opportunity"],
+        counts["hits"],
+    ]
+    if any(value < 0 for value in ordered) or any(
+        left < right for left, right in zip(ordered, ordered[1:])
+    ):
+        raise ValueError(f"Loss waterfall counts are not nested: {counts}")
+    denominator = float(counts["positives"])
+    result = {
+        "item_constraint_loss": (ordered[0] - ordered[1]) / denominator,
+        "model_catalog_loss": (ordered[1] - ordered[2]) / denominator,
+        "retrieval_loss": (ordered[2] - ordered[3]) / denominator,
+        "slate_constraint_loss": (ordered[3] - ordered[4]) / denominator,
+        "ranking_selection_loss": (ordered[4] - ordered[5]) / denominator,
+        "hit_share": ordered[5] / denominator,
+    }
+    if not np.isclose(sum(result.values()), 1.0, rtol=0.0, atol=1e-12):
+        raise RuntimeError("Loss waterfall failed its additive identity")
+    return result
+
+
 def normalize_front(front: Sequence[SlateSolution]) -> np.ndarray:
     if not front:
         return np.empty((0, 0), dtype=float)
@@ -46,6 +112,58 @@ def hypervolume_sobol(front: Sequence[SlateSolution], sample_power: int = 14, se
     samples = qmc.Sobol(d=normalized.shape[1], scramble=True, seed=seed).random_base2(sample_power)
     dominated = np.any(np.all(normalized[:, None, :] >= samples[None, :, :], axis=2), axis=0)
     return float(np.mean(dominated))
+
+
+def hypervolume_shared(
+    front: Sequence[SlateSolution],
+    *,
+    lower: Sequence[float] | None = None,
+    upper: Sequence[float] | None = None,
+    sample_power: int = 14,
+    seed: int = 42,
+) -> float:
+    """Estimate HV on explicit shared maximization bounds.
+
+    Unlike ``hypervolume_sobol``, this function never derives bounds from one
+    method's observed front, so values are comparable across methods.
+    """
+    if not front:
+        return 0.0
+    values = np.asarray([solution.maximization_values for solution in front], dtype=float)
+    dimensions = values.shape[1]
+    low = np.asarray(lower if lower is not None else np.zeros(dimensions), dtype=float)
+    high = np.asarray(upper if upper is not None else np.ones(dimensions), dtype=float)
+    if low.shape != (dimensions,) or high.shape != (dimensions,):
+        raise ValueError("shared hypervolume bounds must match objective dimensions")
+    if np.any(high <= low):
+        raise ValueError("shared hypervolume upper bounds must exceed lower bounds")
+    normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
+    samples = qmc.Sobol(d=dimensions, scramble=True, seed=seed).random_base2(sample_power)
+    dominated = np.any(
+        np.all(normalized[:, None, :] >= samples[None, :, :], axis=2), axis=0
+    )
+    return float(np.mean(dominated))
+
+
+def spacing_shared(
+    front: Sequence[SlateSolution],
+    *,
+    lower: Sequence[float] | None = None,
+    upper: Sequence[float] | None = None,
+) -> float:
+    """Nearest-neighbour spacing on explicit shared bounds."""
+    if len(front) < 2:
+        return 0.0
+    values = np.asarray([solution.maximization_values for solution in front], dtype=float)
+    dimensions = values.shape[1]
+    low = np.asarray(lower if lower is not None else np.zeros(dimensions), dtype=float)
+    high = np.asarray(upper if upper is not None else np.ones(dimensions), dtype=float)
+    normalized = np.clip((values - low) / (high - low), 0.0, 1.0)
+    minimum_distances = []
+    for index, point in enumerate(normalized):
+        others = np.delete(normalized, index, axis=0)
+        minimum_distances.append(float(np.min(np.linalg.norm(others - point, axis=1))))
+    return float(np.std(minimum_distances))
 
 
 def spacing(front: Sequence[SlateSolution]) -> float:

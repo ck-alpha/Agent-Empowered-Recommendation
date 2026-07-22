@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, Mapping, Sequence
 
 import pandas as pd
 
-from copa.core import OptimizationConfig
+from copa.core import OptimizationConfig, RecommendationRequest
 from copa.data import build_synthetic_case
 from copa.metrics import ndcg_at_k, recall_at_k
 from copa.phase2 import NaturalLanguageCOPAPipeline, NaturalLanguageRecommendationRequest
+from copa.session import COPAExecutionSession
 
-from .models import AgentRecommendationRequest
+from .models import AgentExecutionPlan, AgentRecommendationRequest
+from .tools import AgentPlanExecutor
 from .workflow import AgentCOPAPipeline
 
 
@@ -213,10 +216,51 @@ def evaluate_mode_comparison(
         phase2_result = phase2_pipeline.run(phase2_request)
         latency = perf_counter() - started
         phase2_recommendation = phase2_result.recommendation
+        if case.get("fault") and phase2_result.compile_result.succeeded:
+            compiled = phase2_result.compile_result.plan
+            strategy = "pareto" if len(compiled.executable_objectives) > 1 else "feasible_topk"
+            selection = "optimize_pareto" if strategy == "pareto" else "select_feasible_topk"
+            fixed_plan = AgentExecutionPlan.model_validate(
+                {
+                    "plan_version": "1.0",
+                    "strategy": strategy,
+                    "steps": [
+                        {"tool": "apply_constraints"},
+                        {"tool": "compute_objectives"},
+                        {"tool": selection},
+                        {"tool": "verify"},
+                    ],
+                    "assumptions": [],
+                    "unresolved_requirements": [],
+                }
+            )
+            fixed_session = COPAExecutionSession(
+                RecommendationRequest(
+                    user_id=phase2_request.user_id,
+                    candidates=phase2_request.candidates,
+                    constraints=compiled.executable_constraints,
+                    objectives=compiled.executable_objectives,
+                    optimization=replace(
+                        phase2_request.optimization, top_k=compiled.top_k
+                    ),
+                    context=phase2_request.context,
+                    slate_constraints=compiled.executable_slate_constraints,
+                )
+            )
+            AgentPlanExecutor().execute(
+                fixed_plan,
+                fixed_session,
+                fault={"type": case["fault"]},
+            )
+            phase2_recommendation = fixed_session.result()
         rows.append(_comparison_row(
             case,
             "phase2_fixed",
-            phase2_result.compile_result.status,
+            (
+                phase2_recommendation.status
+                if phase2_recommendation is not None
+                else phase2_result.compile_result.status
+            ),
             phase2_recommendation,
             fixture,
             latency,

@@ -109,6 +109,7 @@ def _method_requests(
                     [ObjectiveSpec("relevance", "maximize", "candidate")],
                     hard_config,
                     case.context,
+                    case.slate_constraints,
                 ),
             )
         ]
@@ -123,11 +124,11 @@ def _method_requests(
         return [
             (
                 "relevance_topk",
-                RecommendationRequest(case.user_id, case.candidates, [], all_objectives, relevance_config, case.context),
+                RecommendationRequest(case.user_id, case.candidates, [], all_objectives, relevance_config, case.context, ()),
             ),
             (
                 "pareto_nsga2",
-                RecommendationRequest(case.user_id, case.candidates, [], all_objectives, optimization, case.context),
+                RecommendationRequest(case.user_id, case.candidates, [], all_objectives, optimization, case.context, ()),
             ),
         ]
     if experiment == "C":
@@ -141,6 +142,7 @@ def _method_requests(
                     all_objectives,
                     optimization,
                     case.context,
+                    case.slate_constraints,
                 ),
             )
         ]

@@ -49,6 +49,18 @@ class ObjectiveRegistry:
                 raise ValueError(f"Unsupported objective scope: {spec.scope}")
         return specs
 
+    def compile(
+        self,
+        frame: pd.DataFrame,
+        specs: Iterable[ObjectiveSpec],
+        context: Mapping[str, Any] | None = None,
+    ) -> "CompiledObjectiveSet":
+        """Build a request-local evaluator without repeated DataFrame indexing."""
+
+        return CompiledObjectiveSet(
+            self, frame, self.validate(specs), context or {}
+        )
+
     def evaluate(
         self,
         item_ids: Sequence[str],
@@ -177,4 +189,159 @@ class ObjectiveRegistry:
         groups = set(target_distribution) | set(observed_counts)
         observed = {group: observed_counts.get(group, 0) / len(selected_groups) for group in groups}
         total_variation = 0.5 * sum(abs(observed.get(group, 0.0) - target_distribution.get(group, 0.0)) for group in groups)
+        return float(np.clip(1.0 - total_variation, 0.0, 1.0))
+
+
+class CompiledObjectiveSet:
+    """Array/record-backed equivalent for the built-in formal objectives."""
+
+    _BUILT_INS = {"relevance", "diversity", "novelty", "fairness"}
+
+    def __init__(
+        self,
+        registry: ObjectiveRegistry,
+        frame: pd.DataFrame,
+        specs: Sequence[ObjectiveSpec],
+        context: Mapping[str, Any],
+    ) -> None:
+        self.registry = registry
+        self.frame = frame
+        self.specs = tuple(specs)
+        self.context = context
+        self.records = tuple(frame.to_dict("records"))
+        self.item_ids = tuple(str(record["item_id"]) for record in self.records)
+        if len(set(self.item_ids)) != len(self.item_ids):
+            raise ValueError("Compiled objectives require unique item ids")
+        self.index_by_item_id = {
+            item_id: index for index, item_id in enumerate(self.item_ids)
+        }
+        self.base_scores = np.asarray(
+            [float(record["base_score"]) for record in self.records], dtype=float
+        )
+        self._attribute_values: Dict[str, tuple[Any, ...]] = {}
+
+    def _indices(self, item_ids: Sequence[str]) -> np.ndarray:
+        normalized = [str(item_id) for item_id in item_ids]
+        unknown = [
+            item_id for item_id in normalized if item_id not in self.index_by_item_id
+        ]
+        if unknown:
+            raise KeyError(f"Unknown item ids in objective evaluation: {unknown[:5]}")
+        return np.asarray(
+            [self.index_by_item_id[item_id] for item_id in normalized], dtype=np.int64
+        )
+
+    def _attribute(self, name: str) -> tuple[Any, ...]:
+        if name not in self._attribute_values:
+            self._attribute_values[name] = tuple(
+                resolve_attribute(record, name) for record in self.records
+            )
+        return self._attribute_values[name]
+
+    def evaluate(self, item_ids: Sequence[str]) -> Dict[str, float]:
+        indices = self._indices(item_ids)
+        values: Dict[str, float] = {}
+        for spec in self.specs:
+            evaluator_name = self.registry._evaluator_name(spec)
+            if evaluator_name == "relevance":
+                value = self._relevance(indices)
+            elif evaluator_name == "diversity":
+                value = self._diversity(indices, spec)
+            elif evaluator_name == "novelty":
+                value = self._novelty(indices, spec)
+            elif evaluator_name == "fairness":
+                value = self._fairness(indices, spec)
+            else:
+                value = float(
+                    self.registry._evaluators[evaluator_name](
+                        item_ids, self.frame, spec, self.context
+                    )
+                )
+            if not np.isfinite(value):
+                raise ValueError(
+                    f"Objective {spec.name} produced non-finite value: {value}"
+                )
+            values[spec.name] = float(value)
+        return values
+
+    def _relevance(self, indices: np.ndarray) -> float:
+        if len(indices) == 0:
+            return 0.0
+        scores = self.base_scores[indices]
+        weights = 1.0 / np.log2(np.arange(2, len(scores) + 2))
+        return float(np.average(scores, weights=weights))
+
+    def _diversity(self, indices: np.ndarray, spec: ObjectiveSpec) -> float:
+        if len(indices) < 2:
+            return 0.0
+        embeddings = self.context.get("item_embeddings", {})
+        attribute = str(spec.params.get("attribute", "brand_id"))
+        attribute_values = self._attribute(attribute)
+        distances: List[float] = []
+        for left_position, right_position in combinations(range(len(indices)), 2):
+            left_index = int(indices[left_position])
+            right_index = int(indices[right_position])
+            left_id = self.item_ids[left_index]
+            right_id = self.item_ids[right_index]
+            if left_id in embeddings and right_id in embeddings:
+                left = np.asarray(embeddings[left_id], dtype=float)
+                right = np.asarray(embeddings[right_id], dtype=float)
+                denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+                similarity = float(np.dot(left, right) / denominator) if denominator else 0.0
+                distances.append(float(np.clip(1.0 - similarity, 0.0, 2.0) / 2.0))
+                continue
+            left_value = attribute_values[left_index]
+            right_value = attribute_values[right_index]
+            if isinstance(left_value, (list, tuple, set, frozenset)) and isinstance(
+                right_value, (list, tuple, set, frozenset)
+            ):
+                left_set, right_set = set(left_value), set(right_value)
+                union = left_set | right_set
+                distances.append(
+                    1.0 - len(left_set & right_set) / len(union) if union else 0.0
+                )
+            else:
+                distances.append(float(left_value != right_value))
+        return float(np.mean(distances))
+
+    def _novelty(self, indices: np.ndarray, spec: ObjectiveSpec) -> float:
+        if len(indices) == 0:
+            return 0.0
+        attribute = str(spec.params.get("attribute", "popularity"))
+        values = self._attribute(attribute)
+        popularity = np.asarray([float(values[int(index)]) for index in indices])
+        return float(np.mean(1.0 - np.clip(popularity, 0.0, 1.0)))
+
+    def _fairness(self, indices: np.ndarray, spec: ObjectiveSpec) -> float:
+        if len(indices) == 0:
+            return 0.0
+        attribute = str(spec.params.get("attribute", "group"))
+        values = self._attribute(attribute)
+        selected_groups = [values[int(index)] for index in indices]
+        observed_counts = Counter(selected_groups)
+        target = spec.params.get("target_distribution")
+        if target is None:
+            groups = sorted(set(values), key=str)
+            target_distribution = (
+                {group: 1.0 / len(groups) for group in groups} if groups else {}
+            )
+        else:
+            target_distribution = {
+                key: float(value) for key, value in dict(target).items()
+            }
+            total = sum(target_distribution.values())
+            if total <= 0:
+                raise ValueError("fairness target_distribution must have positive mass")
+            target_distribution = {
+                key: value / total for key, value in target_distribution.items()
+            }
+        groups = set(target_distribution) | set(observed_counts)
+        observed = {
+            group: observed_counts.get(group, 0) / len(selected_groups)
+            for group in groups
+        }
+        total_variation = 0.5 * sum(
+            abs(observed.get(group, 0.0) - target_distribution.get(group, 0.0))
+            for group in groups
+        )
         return float(np.clip(1.0 - total_variation, 0.0, 1.0))

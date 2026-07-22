@@ -65,7 +65,7 @@ def build_compiler(config: Dict[str, Any], audit_dir: Path | None = None) -> Con
             max_attempts=int(compiler.get("max_attempts", 2)),
             retry_backoff_seconds=float(compiler.get("retry_backoff_seconds", 0.5)),
             audit_dir=audit_dir,
-            prompt_version=str(compiler.get("prompt_version", "constraint_compiler_v2")),
+            prompt_version=str(compiler.get("prompt_version", "constraint_compiler_v4")),
         ),
     )
 
@@ -113,6 +113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidates=case.candidates,
             domain=args.domain,
             base_constraints=case.constraints,
+            base_slate_constraints=case.slate_constraints,
             optimization=optimization,
             context=case.context,
         )

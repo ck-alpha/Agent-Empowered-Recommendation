@@ -6,6 +6,7 @@ COPA（Constraint-Oriented Pareto Optimization Agent for Recommendation）第一
 Candidate Generation
   -> Candidate State Bus
   -> Hard Constraint Registry
+  -> Slate Constraint Registry + exact MILP preflight
   -> Soft Objective Registry
   -> NSGA-II Pareto Optimization
   -> Deterministic Verifier
@@ -23,7 +24,7 @@ Natural-language Request
 
 Phase 1/2 中 LLM 只解析自然语言，不生成 SQL、物品 ID、排序结果或优化参数。Phase 3 使用独立 LangGraph 组织可恢复 Agent 状态图，但不使用 LangChain Agent；确定性工具仍负责候选选择和验证。
 
-Phase 3 配置使用版本化 `constraint_compiler_v3`，在 v2 的闭世界语义规则上增加 prompt-injection 分离：恶意控制语句不作为业务约束或澄清项，但同一请求中可分离的合法推荐条件仍会被编译。Phase 2 配置继续保留 v2，便于历史实验复现。
+Phase 2/3 的当前协议使用 `constraint_compiler_v4` 与 Constraint IR v1.1。IR 以 `scope=item|slate` 区分逐物品条件和列表聚合；v1.0 输入继续按 item scope 兼容读取。旧 v1–v3 Prompt 文件仍保留用于历史复现。
 
 ## 安装
 
@@ -59,6 +60,141 @@ python -m copa.experiments.run_phase1 --config COPA/configs/experiment_c.yaml --
 ```
 
 正式配置默认使用现有 `data/processed/beauty_scenario1_*.parquet`，执行 100 用户、3 个 seed、Top-10、100 个候选、100 个个体和 50 代优化。建议先运行 smoke。
+
+### 核心论文实验与自动报告
+
+强化主对比将固定用户队列与优化 seed 解耦，运行 Hard-only、Soft-only、Joint 三组共八个方法单元，并使用原始业务约束进行统一严评：
+
+```bash
+python -m copa.experiments.run_core \
+  --config COPA/configs/core_experiment.yaml \
+  --suite core --workers 4 --cohort-seed 42 \
+  --output-dir COPA/results/core_run --resume
+```
+
+完整三阶段实验由可恢复 supervisor 顺序执行测试、smoke、Phase 1、三次 Phase 2、三次 Phase 3、统计和制图，适合在 tmux 中运行：
+
+```bash
+python -m copa.experiments.supervisor \
+  --output-dir COPA/results/copa_core_TIMESTAMP \
+  --workers 4 --cohort-seed 42 --repeats 3 --resume
+```
+
+仅从已保存原始结果重建统计、PNG/PDF 和中文报告：
+
+```bash
+python -m copa.experiments.analyze_core --input-dir COPA/results/copa_core_TIMESTAMP
+```
+
+supervisor 会保存 `run_manifest.json`、`stage_status.jsonl`、`resource_usage.csv`、逐阶段日志和精确命令。失败后使用同一输出目录及 `--resume`，已完成阶段不会重跑，Phase 1 还会复用逐用户/seed 的原子 checkpoint。
+
+## 成熟召回层：RecBole BPR、ItemKNN 与 SASRec
+
+正式召回实验自 2026-07-18 起统一使用 `recbole==1.2.1`。仓库原有 PyTorch BPR 是可复现的 legacy 自研基线，不再参与正式方法选择；`src/run_scenario1_baselines.py` 中由 `implicit` 提供的成熟 Item-KNN 变体必须显式命名为 `itemknn_bm25`、`itemknn_tfidf` 或 `itemknn_cosine`，不能与 RecBole ItemKNN 合并报告。SASRec 使用 RecBole 自带的 TransformerEncoder，不需要安装 Hugging Face `transformers`。
+
+安装并校验独立依赖：
+
+```bash
+conda run -n LLM_Rec python -m pip install -r COPA/requirements-retrieval.txt
+conda run -n LLM_Rec python -m pip check
+```
+
+三模型最小训练、full-sort 和 artifact 集成 smoke：
+
+```bash
+cd COPA
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
+  smoke --output-dir results/retrieval_smoke
+```
+
+正式 Beauty/Electronics 去重 5-core、冻结 train 的时序切分与三 seed 重训（从仓库根目录执行）：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
+  suite --config COPA/configs/retrieval_extension.yaml \
+  --output-dir COPA/results/retrieval_formal --resume
+```
+
+训练、validation-only slate calibration、正式矩阵和核心消融可以用可恢复脚本顺序执行；长任务应放入 tmux：
+
+```bash
+tmux new-session -d -s copa_slate_multi_positive_v2 \
+  "bash COPA/scripts/run_slate_multi_positive_v2.sh \
+   COPA/results/slate_multi_positive_v2 4 2>&1 | tee /tmp/copa_slate_multi_positive_v2.log"
+```
+
+已有 v2 召回 artifact 时，kernel-v2 优化重跑不重新训练模型。门控脚本依次执行全量测试、两数据集严格校准、artifact/multi-positive 复核、8+8 用户满预算性能 pilot，全部通过后才启动正式矩阵：
+
+```bash
+tmux new-session -d -s copa_slate_multi_positive_v2_optimized \
+  "bash COPA/scripts/run_slate_multi_positive_v2_optimized.sh \
+   COPA/results/slate_multi_positive_v2_20260719 \
+   COPA/results/slate_multi_positive_v2_optimized_20260721 12"
+```
+
+运行状态见新目录的 `runner_status.json`；各 evaluation 子目录另有原子 `task_results/` 与持续更新的 `progress.json`。正式进程固定 `OMP/OPENBLAS/MKL/NUMEXPR` 单线程，12 个 worker 不会在每个 worker 内再次过度并行。校准或 pilot 任一门槛失败都会保留搜索表/诊断并停止，旧结果不会进入新汇总。
+
+每用户最后两条交互是同一 test positive set，倒数第三条是 validation，其余为 train。请求统计、seen set、流行度、预算和 SASRec 查询历史只读取 train；validation 只选模型，test 不参与构造。候选目录仅允许 train 中出现的物品，test-only 目标以空 score/rank 记录为 model-catalog loss。RecBole 的 checkpoint-selection evaluator 同样屏蔽 validation/test-only 目录物品，避免随机初始化的冷物品 embedding 影响 early stopping。
+
+三模型对全部 Beauty 253 / Electronics 33,138 用户执行统一 multi-positive full-sort；下游优化固定使用 Beauty 全部 253 用户和 `cohort_seed=42` 的 Electronics 500 用户，名单保存为 `downstream_users.txt`，不按 coverage、item eligibility 或 slate opportunity 过滤。SASRec 的两个未来正例共享同一冻结查询，不会被错误拆成两条不同历史；显式 `item_id_list` 与 target `item_id` 强制共享同一 RecBole token vocabulary，并按每个 trial 的 `MAX_ITEM_LIST_LENGTH` 保留最近历史。
+
+suite 还会生成 `popularity_full_sort.csv`。正式请求统计只使用 train；协议是严格的用户内时间冻结，并不是全局时间切分，因此不能宣称消除了所有 global temporal leakage。
+
+也可以分别执行数据转换与单模型训练：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension prepare \
+  --interactions data/processed/beauty_scenario1_interactions.parquet \
+  --items data/processed/beauty_scenario1_items.parquet \
+  --dataset-name beauty_5core --output-root COPA/results/retrieval_atomic --k-core 5
+
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension train \
+  --data-root COPA/results/retrieval_atomic --dataset-name beauty_5core \
+  --source-interactions data/processed/beauty_scenario1_interactions.parquet \
+  --source-items data/processed/beauty_scenario1_items.parquet \
+  --model sasrec --seed 42 --epochs 100 --stopping-step 10 --candidate-k 500 \
+  --output-dir COPA/results/retrieval_sasrec
+```
+
+对一个候选 artifact 执行真实 K 扫描、Oracle/受控召回以及 COPA 端到端实验：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension evaluate \
+  --manifest COPA/results/retrieval_sasrec/manifest.json \
+  --split COPA/results/retrieval_atomic/beauty_5core/beauty_5core_split.parquet \
+  --items data/processed/beauty_scenario1_items.parquet \
+  --candidate-ks 50,100,200,500 --end-to-end-candidate-k 100 \
+  --optimizer-seeds 42,43,44 --population-size 100 --generations 50 \
+  --interventions --output-dir COPA/results/retrieval_sasrec_evaluation
+```
+
+正式 suite 完成后，一条命令执行全部三 seed 召回扫描、seed-42 三召回器 medium 端到端矩阵、loose/medium/tight sweep、Oracle/六档 pair-level 受控敏感性实验，以及 item-only 和无 MILP seed/feasible operators 消融：
+
+```bash
+conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
+  evaluate-suite --suite-dir COPA/results/retrieval_formal \
+  --workers 4 --resume
+```
+
+端到端任务按 dataset/retriever/condition/user/method/optimizer-seed 保存原子 checkpoint；中断后 `--resume` 不会重算签名一致的 population=100、generations=50 优化任务。签名绑定 kernel version、校准、cohort、方法、seed、搜索预算、受控比例和 intervention seed；kernel-v1 或不同协议的未完成任务会安全失效。
+
+候选 parquet 的稳定字段为：
+
+```text
+user_id, item_id, raw_score, base_score, retrieval_rank,
+retriever, backend, model_seed
+```
+
+Artifact v2 的 `targets.parquet` 是长表：
+
+```text
+user_id, target_item_id, target_order, target_timestamp,
+target_raw_score, target_base_score, target_full_rank, target_model_covered
+```
+
+model-uncovered 目标的三项 score/rank 必须为空；covered 目标必须有限并与候选排序严格一致。Reader 可把 v1 单目标 artifact 提升为单元素集合，但新 writer 只生成 v2。Manifest 绑定 split policy、positive set、train catalog、request cutoff、calibration、benchmark、checkpoint 和 artifact hashes。
+
+下游逐用户计算 `P→I→M→C→U→H`，将 item constraint、model catalog、retrieval、slate constraint、ranking/selection 五类损失和 `H/|P|` 严格加和为 1；同时报告 multi-positive Recall/NDCG、legacy first-positive 对照、eligible rates、opportunity recall、constraint-aware NDCG、full-K 严格 CSR、delivered-slate Verifier pass、逐约束 violation magnitude、2 秒 preflight/5 秒 opportunity solver cost、P50/P95、shared HV/Spacing 与配对 user bootstrap。
 
 ## Phase 2：Qwen Constraint Compiler
 
@@ -122,7 +258,7 @@ python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml cleanup --thre
 python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml cleanup --older-than-days 7
 ```
 
-运行 36 条中英 Agent Gold：
+运行 44 条中英 Agent Gold（含 8 条列表级故障）：
 
 ```bash
 python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml evaluate \

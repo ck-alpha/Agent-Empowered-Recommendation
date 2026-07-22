@@ -131,6 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 case.candidates,
                 domain=args.domain,
                 base_constraints=case.constraints,
+                base_slate_constraints=case.slate_constraints,
                 optimization=OptimizationConfig(
                     top_k=int(optimization.get("top_k", 10)),
                     population_size=int(optimization.get("population_size", 30)),

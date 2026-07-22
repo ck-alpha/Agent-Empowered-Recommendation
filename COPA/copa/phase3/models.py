@@ -8,7 +8,13 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from copa.core import CandidateRecord, ConstraintSpec, OptimizationConfig, RecommendationResult
+from copa.core import (
+    CandidateRecord,
+    ConstraintSpec,
+    OptimizationConfig,
+    RecommendationResult,
+    SlateConstraintSpec,
+)
 
 
 AgentStatus = Literal["success", "clarification_required", "failed"]
@@ -71,6 +77,7 @@ class AgentRecommendationRequest:
     base_constraints: Sequence[ConstraintSpec] = field(default_factory=list)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     context: Mapping[str, Any] = field(default_factory=dict)
+    base_slate_constraints: Sequence[SlateConstraintSpec] = field(default_factory=list)
 
     def to_state_dict(self) -> Dict[str, Any]:
         return {
@@ -87,6 +94,9 @@ class AgentRecommendationRequest:
             ],
             "domain": self.domain,
             "base_constraints": [asdict(spec) for spec in self.base_constraints],
+            "base_slate_constraints": [
+                asdict(spec) for spec in self.base_slate_constraints
+            ],
             "optimization": asdict(self.optimization),
             "context": dict(self.context),
         }
@@ -101,6 +111,10 @@ class AgentRecommendationRequest:
             base_constraints=[ConstraintSpec.from_dict(item) for item in payload.get("base_constraints", [])],
             optimization=OptimizationConfig(**dict(payload.get("optimization", {}))),
             context=dict(payload.get("context", {})),
+            base_slate_constraints=[
+                SlateConstraintSpec.from_dict(item)
+                for item in payload.get("base_slate_constraints", [])
+            ],
         )
 
 

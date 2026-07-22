@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Sequence
 
 import numpy as np
 
-from copa.core import CandidateRecord, ConstraintSpec
+from copa.core import CandidateRecord, ConstraintSpec, SlateConstraintSpec
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,7 @@ class UserCase:
     constraints: Sequence[ConstraintSpec]
     relevant_items: Sequence[str]
     context: Dict[str, object]
+    slate_constraints: Sequence[SlateConstraintSpec] = field(default_factory=tuple)
 
 
 def build_synthetic_case(seed: int = 42, candidate_count: int = 30) -> UserCase:

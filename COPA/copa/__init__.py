@@ -1,6 +1,6 @@
 """COPA: Constraint-Oriented Pareto Optimization Agent for Recommendation."""
 
-from .constraints import ConstraintRegistry
+from .constraints import ConstraintRegistry, SlateConstraintRegistry
 from .core import (
     CandidateRecord,
     CandidateStateBus,
@@ -10,6 +10,8 @@ from .core import (
     OptimizationConfig,
     RecommendationRequest,
     RecommendationResult,
+    SlateConstraintEvaluation,
+    SlateConstraintSpec,
     VerificationReport,
 )
 from .core.verifier import DeterministicVerifier
@@ -58,6 +60,7 @@ __all__ = [
     "ConstraintIR",
     "DomainSchemaRegistry",
     "ConstraintRegistry",
+    "SlateConstraintRegistry",
     "ConstraintSpec",
     "DeterministicVerifier",
     "ObjectiveRegistry",
@@ -71,6 +74,8 @@ __all__ = [
     "PlannerAgent",
     "RecommendationRequest",
     "RecommendationResult",
+    "SlateConstraintEvaluation",
+    "SlateConstraintSpec",
     "RepairAgent",
     "RepairDecision",
     "VerificationReport",

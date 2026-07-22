@@ -12,7 +12,7 @@ class ConstraintCompilerPrompt:
         "You are a constrained semantic compiler. Follow the supplied closed-world schema and return only valid JSON."
     )
 
-    def __init__(self, template_path: Optional[Path] = None, *, version: str = "constraint_compiler_v2"):
+    def __init__(self, template_path: Optional[Path] = None, *, version: str = "constraint_compiler_v4"):
         self.version = version
         path = template_path or Path(__file__).with_name("prompts") / f"{version}.txt"
         self.template = path.read_text(encoding="utf-8")

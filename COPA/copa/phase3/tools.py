@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from copa.constraints import SlateConstraintRegistry, resolve_attribute
 from copa.session import COPAExecutionSession
 
 from .models import AgentExecutionPlan
@@ -77,11 +78,109 @@ class AgentPlanExecutor:
             item_ids = item_ids[:-1]
         elif kind == "non_finite" and objective_values:
             objective_values[next(iter(objective_values))] = float("nan")
+        elif kind in {
+            "total_price_over",
+            "brand_cap_over",
+            "coverage_under",
+            "forged_optimizer_feasible",
+        }:
+            requested_type = {
+                "total_price_over": "aggregate_sum",
+                "brand_cap_over": "per_group_count",
+                "coverage_under": "distinct_count",
+                "forged_optimizer_feasible": None,
+            }[kind]
+            item_ids = AgentPlanExecutor._violating_slate(
+                session, requested_type=requested_type
+            )
+            if kind == "forged_optimizer_feasible":
+                session.selected.constraint_feasible = True
+                session.selected.constraint_violation = 0.0
         elif kind:
             raise ValueError(f"Unknown deterministic fault type: {kind}")
         session.selected.item_ids = item_ids
         session.selected.objective_values = objective_values
         return session.verify(item_ids=item_ids, objective_values=objective_values)
+
+    @staticmethod
+    def _violating_slate(
+        session: COPAExecutionSession, *, requested_type: Optional[str]
+    ) -> list[str]:
+        specs = [
+            spec
+            for spec in session.request.slate_constraints
+            if requested_type is None or spec.type == requested_type
+        ]
+        if not specs:
+            raise ValueError(
+                f"Fault requires a {requested_type or 'slate'} hard constraint"
+            )
+        spec = specs[0]
+        frame = session.bus.query(feasible_only=True)
+        requested_k = session.request.optimization.top_k
+        rows = frame.to_dict("records")
+        if len(rows) < requested_k:
+            raise ValueError("Fault fixture has fewer than K item-feasible candidates")
+
+        reverse_bound = spec.operator in {"<", "<="}
+        if spec.type == "aggregate_sum":
+            ordered = sorted(
+                rows,
+                key=lambda row: (
+                    float(resolve_attribute(row, spec.attribute)), str(row["item_id"])
+                ),
+                reverse=reverse_bound,
+            )
+        else:
+            groups: Dict[Any, list[Mapping[str, Any]]] = {}
+            for row in rows:
+                groups.setdefault(resolve_attribute(row, spec.attribute), []).append(row)
+            for values in groups.values():
+                values.sort(key=lambda row: str(row["item_id"]))
+            if spec.type == "distinct_count":
+                if spec.operator in {">", ">="}:
+                    ordered = [
+                        row
+                        for _, values in sorted(
+                            groups.items(), key=lambda pair: (-len(pair[1]), str(pair[0]))
+                        )
+                        for row in values
+                    ]
+                else:
+                    ordered = []
+                    maximum = max(len(values) for values in groups.values())
+                    for position in range(maximum):
+                        for key in sorted(groups, key=str):
+                            if position < len(groups[key]):
+                                ordered.append(groups[key][position])
+            elif spec.type == "per_group_count":
+                ordered = [
+                    row
+                    for _, values in sorted(
+                        groups.items(), key=lambda pair: (-len(pair[1]), str(pair[0]))
+                    )
+                    for row in values
+                ]
+            else:
+                targets = set(spec.target_values)
+                target_rows = [
+                    row
+                    for row in rows
+                    if resolve_attribute(row, spec.attribute) in targets
+                ]
+                other_rows = [row for row in rows if row not in target_rows]
+                ordered = (
+                    target_rows + other_rows
+                    if spec.operator in {"<", "<="}
+                    else other_rows + target_rows
+                )
+        item_ids = [str(row["item_id"]) for row in ordered[:requested_k]]
+        evaluated = SlateConstraintRegistry().evaluate(spec, item_ids, frame)
+        if evaluated.satisfied:
+            raise ValueError(
+                f"Fault fixture cannot produce a violation for slate constraint {spec.id}"
+            )
+        return item_ids
 
     @staticmethod
     def _summarize(

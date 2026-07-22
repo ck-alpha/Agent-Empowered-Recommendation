@@ -11,8 +11,13 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from copa.constraints import ConstraintRegistry
-from copa.core import CandidateRecord, CandidateStateBus, ConstraintSpec
+from copa.constraints import ConstraintRegistry, SlateConstraintRegistry
+from copa.core import (
+    CandidateRecord,
+    CandidateStateBus,
+    ConstraintSpec,
+    SlateConstraintSpec,
+)
 
 from .audit import CompilerAuditLogger
 from .domain import DomainSchema
@@ -27,7 +32,7 @@ class CompilerConfig:
     max_attempts: int = 2
     retry_backoff_seconds: float = 0.5
     audit_dir: Optional[Path] = None
-    prompt_version: str = "constraint_compiler_v2"
+    prompt_version: str = "constraint_compiler_v4"
 
 
 class ConstraintCompiler:
@@ -54,6 +59,7 @@ class ConstraintCompiler:
         candidates: Sequence[CandidateRecord],
         base_constraints: Sequence[ConstraintSpec] = (),
         clarification_answers: Sequence[str] = (),
+        base_slate_constraints: Sequence[SlateConstraintSpec] = (),
     ) -> CompileResult:
         started = perf_counter()
         request_id = uuid4().hex
@@ -130,7 +136,13 @@ class ConstraintCompiler:
                 self._audit(audit, request_id, request_hash, audit_text, domain_schema, result)
                 return result
 
-            plan = self.semantic.compile(ir, domain_schema, candidates, base_constraints)
+            plan = self.semantic.compile(
+                ir,
+                domain_schema,
+                candidates,
+                base_constraints,
+                base_slate_constraints,
+            )
             self._preflight(plan, candidates)
             blocking = [issue for issue in plan.issues if issue.severity == "blocking"]
             status = "clarification_required" if blocking else "success"
@@ -169,7 +181,8 @@ class ConstraintCompiler:
                 )
             )
             return
-        feasible = len(bus.query(feasible_only=True))
+        feasible_frame = bus.query(feasible_only=True)
+        feasible = len(feasible_frame)
         if feasible == 0:
             plan.issues.append(
                 CompileIssue(
@@ -183,10 +196,47 @@ class ConstraintCompiler:
             plan.issues.append(
                 CompileIssue(
                     code="candidate_shortage",
-                    severity="warning",
+                    severity="blocking",
                     message=f"Only {feasible} candidates satisfy the constraints for requested top_k={plan.top_k}",
+                    clarification_question="Please provide more candidates or revise the hard requirements.",
                 )
             )
+        elif plan.executable_slate_constraints:
+            try:
+                solved = SlateConstraintRegistry().solve(
+                    feasible_frame,
+                    plan.executable_slate_constraints,
+                    plan.top_k,
+                    time_limit_seconds=2.0,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                plan.issues.append(
+                    CompileIssue(
+                        code="invalid_slate_constraint_metadata",
+                        severity="blocking",
+                        message=f"Slate constraints cannot execute: {type(exc).__name__}: {exc}",
+                        clarification_question="Please use a slate requirement supported by the available metadata.",
+                    )
+                )
+                return
+            if solved.status == "infeasible":
+                plan.issues.append(
+                    CompileIssue(
+                        code="slate_constraints_infeasible",
+                        severity="blocking",
+                        message="No full-K slate satisfies all compiled hard constraints.",
+                        clarification_question="Would you like to revise one of the slate requirements?",
+                    )
+                )
+            elif solved.status != "optimal":
+                plan.issues.append(
+                    CompileIssue(
+                        code="slate_solver_unknown",
+                        severity="blocking",
+                        message="Slate feasibility could not be established within the solver limit.",
+                        clarification_question="Please retry or provide a smaller candidate set.",
+                    )
+                )
 
     @staticmethod
     def _merge_usage(existing: Dict[str, Any], current: Any) -> Dict[str, Any]:

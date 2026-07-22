@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from copa.core import CandidateRecord, ConstraintSpec, ObjectiveSpec
+from copa.core import CandidateRecord, ConstraintSpec, ObjectiveSpec, SlateConstraintSpec
 
 from .domain import AttributeCapability, DomainSchema
 from .models import (
@@ -13,6 +13,7 @@ from .models import (
     CompiledConstraint,
     CompiledObjective,
     CompiledPlan,
+    CompiledSlateConstraint,
     ConstraintIR,
 )
 
@@ -29,11 +30,15 @@ class SemanticCompiler:
         domain: DomainSchema,
         candidates: Sequence[CandidateRecord],
         base_constraints: Sequence[ConstraintSpec] = (),
+        base_slate_constraints: Sequence[SlateConstraintSpec] = (),
     ) -> CompiledPlan:
         issues: List[CompileIssue] = []
         assumptions: List[str] = []
         constraints: List[CompiledConstraint] = [
             CompiledConstraint(spec, "system") for spec in base_constraints
+        ]
+        slate_constraints: List[CompiledSlateConstraint] = [
+            CompiledSlateConstraint(spec, "system") for spec in base_slate_constraints
         ]
         for unresolved in ir.unresolved_requirements:
             issues.append(
@@ -60,9 +65,6 @@ class SemanticCompiler:
                     )
                 )
                 continue
-            if raw.operator not in capability.operators:
-                issues.append(self._blocking("invalid_operator", f"Operator {raw.operator} is not valid for {capability.logical_name}", raw.attribute))
-                continue
             if capability.logical_name == "price" and raw.currency:
                 normalized_currency = raw.currency.strip().upper().replace("$", "USD")
                 if normalized_currency not in {domain.currency, "US DOLLAR", "US DOLLARS"}:
@@ -70,6 +72,59 @@ class SemanticCompiler:
                     continue
             elif capability.logical_name == "price" and raw.currency is None:
                 assumptions.append(f"price currency defaulted to domain currency {domain.currency}")
+            if raw.scope == "slate":
+                aggregation = str(raw.aggregation)
+                if aggregation not in capability.slate_aggregations:
+                    issues.append(
+                        self._blocking(
+                            "unsupported_slate_aggregation",
+                            f"{aggregation} is not executable for {capability.logical_name}",
+                            raw.attribute,
+                        )
+                    )
+                    continue
+                if raw.operator not in {"<", "<=", ">", ">=", "==", "between"}:
+                    issues.append(
+                        self._blocking(
+                            "invalid_slate_operator",
+                            f"Operator {raw.operator} cannot bound a slate aggregation",
+                            raw.attribute,
+                        )
+                    )
+                    continue
+                normalized_value, value_issue = self._normalize_slate_bound(
+                    raw.value, raw.operator, capability
+                )
+                if value_issue:
+                    issues.append(value_issue)
+                    continue
+                target_values: list[Any] = []
+                for target in raw.target_values:
+                    resolved, target_issue = self._resolve_catalog_value(
+                        target, capability, domain, candidates
+                    )
+                    if target_issue:
+                        issues.append(target_issue)
+                        break
+                    target_values.append(resolved)
+                else:
+                    slate_constraints.append(
+                        CompiledSlateConstraint(
+                            SlateConstraintSpec(
+                                f"user_slate_hc_{index:03d}",
+                                aggregation,
+                                capability.executable_attribute,
+                                raw.operator,
+                                normalized_value,
+                                tuple(target_values),
+                            ),
+                            "user",
+                        )
+                    )
+                continue
+            if raw.operator not in capability.operators:
+                issues.append(self._blocking("invalid_operator", f"Operator {raw.operator} is not valid for {capability.logical_name}", raw.attribute))
+                continue
             normalized_value, value_issue = self._normalize_value(raw.value, raw.operator, capability, domain, candidates)
             if value_issue:
                 issues.append(value_issue)
@@ -137,7 +192,14 @@ class SemanticCompiler:
         constraints, duplicate_issues = self._deduplicate_constraints(constraints)
         issues.extend(duplicate_issues)
         issues.extend(self._detect_conflicts(constraints))
-        return CompiledPlan(constraints, objectives, top_k, assumptions, issues)
+        return CompiledPlan(
+            constraints=constraints,
+            objectives=objectives,
+            top_k=top_k,
+            slate_constraints=slate_constraints,
+            assumptions=assumptions,
+            issues=issues,
+        )
 
     @staticmethod
     def _blocking(code: str, message: str, field: Optional[str] = None) -> CompileIssue:
@@ -198,6 +260,34 @@ class SemanticCompiler:
                 normalized.append(resolved)
             return normalized, None
         return self._resolve_catalog_value(value, capability, domain, candidates)
+
+    def _normalize_slate_bound(
+        self, value: Any, operator: str, capability: AttributeCapability
+    ) -> Tuple[Any, Optional[CompileIssue]]:
+        if operator == "between":
+            if not isinstance(value, list) or len(value) != 2:
+                return value, self._blocking(
+                    "invalid_between_value",
+                    "between requires exactly two numeric bounds",
+                    capability.logical_name,
+                )
+            try:
+                lower, upper = float(value[0]), float(value[1])
+            except (TypeError, ValueError):
+                return value, self._blocking(
+                    "invalid_numeric_value", "Slate bounds must be numeric", capability.logical_name
+                )
+            if lower > upper:
+                return value, self._blocking(
+                    "reversed_range", "Lower bound exceeds upper bound", capability.logical_name
+                )
+            return [lower, upper], None
+        try:
+            return float(value), None
+        except (TypeError, ValueError):
+            return value, self._blocking(
+                "invalid_numeric_value", "Slate bounds must be numeric", capability.logical_name
+            )
 
     def _resolve_catalog_value(
         self,

@@ -7,3 +7,16 @@ dist/
 logs/
 results/
 checkpoints/
+
+# Code-only publication policy: README is the only published document.
+*.md
+!/README.md
+*.yaml
+*.yml
+*.json
+*.jsonl
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg

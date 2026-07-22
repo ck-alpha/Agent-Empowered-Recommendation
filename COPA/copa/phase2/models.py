@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from copa.core import (
     CandidateRecord,
@@ -14,6 +14,7 @@ from copa.core import (
     ObjectiveSpec,
     OptimizationConfig,
     RecommendationResult,
+    SlateConstraintSpec,
 )
 
 
@@ -47,11 +48,31 @@ class HardConstraintIR(BaseModel):
     operator: ConstraintOperator
     value: IRValue
     currency: Optional[str] = None
+    scope: Literal["item", "slate"] = "item"
+    aggregation: Optional[
+        Literal["aggregate_sum", "distinct_count", "per_group_count", "group_count"]
+    ] = None
+    target_values: List[IRScalar] = Field(default_factory=list)
 
     @field_validator("value")
     @classmethod
     def finite_value(cls, value: Any) -> Any:
         return _ensure_finite(value)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "HardConstraintIR":
+        if self.scope == "item" and (
+            self.aggregation is not None or self.target_values
+        ):
+            raise ValueError("item constraints cannot declare slate aggregation fields")
+        if self.scope == "slate" and self.aggregation is None:
+            raise ValueError("slate constraints require an aggregation")
+        if self.scope == "slate" and self.aggregation == "group_count":
+            if not self.target_values:
+                raise ValueError("group_count requires target_values")
+        elif self.target_values:
+            raise ValueError("target_values are only valid for group_count")
+        return self
 
 
 class SoftObjectiveIR(BaseModel):
@@ -74,7 +95,7 @@ class ConstraintIR(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     hard_constraints: List[HardConstraintIR]
     soft_objectives: List[SoftObjectiveIR]
     top_k: Optional[int]
@@ -101,6 +122,15 @@ class CompiledConstraint:
 
 
 @dataclass(frozen=True)
+class CompiledSlateConstraint:
+    spec: SlateConstraintSpec
+    provenance: Provenance
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"spec": asdict(self.spec), "provenance": self.provenance}
+
+
+@dataclass(frozen=True)
 class CompiledObjective:
     spec: ObjectiveSpec
     provenance: Provenance
@@ -114,6 +144,7 @@ class CompiledPlan:
     constraints: List[CompiledConstraint]
     objectives: List[CompiledObjective]
     top_k: int
+    slate_constraints: List[CompiledSlateConstraint] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
     issues: List[CompileIssue] = field(default_factory=list)
 
@@ -125,9 +156,14 @@ class CompiledPlan:
     def executable_objectives(self) -> List[ObjectiveSpec]:
         return [entry.spec for entry in self.objectives]
 
+    @property
+    def executable_slate_constraints(self) -> List[SlateConstraintSpec]:
+        return [entry.spec for entry in self.slate_constraints]
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "constraints": [entry.to_dict() for entry in self.constraints],
+            "slate_constraints": [entry.to_dict() for entry in self.slate_constraints],
             "objectives": [entry.to_dict() for entry in self.objectives],
             "top_k": self.top_k,
             "assumptions": self.assumptions,
@@ -174,6 +210,7 @@ class NaturalLanguageRecommendationRequest:
     base_constraints: Sequence[ConstraintSpec] = field(default_factory=list)
     optimization: OptimizationConfig = field(default_factory=OptimizationConfig)
     context: Mapping[str, Any] = field(default_factory=dict)
+    base_slate_constraints: Sequence[SlateConstraintSpec] = field(default_factory=list)
 
 
 @dataclass
