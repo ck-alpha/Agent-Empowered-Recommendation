@@ -26,6 +26,8 @@ Phase 1/2 中 LLM 只解析自然语言，不生成 SQL、物品 ID、排序结�
 
 Phase 2/3 的当前协议使用 `constraint_compiler_v4` 与 Constraint IR v1.1。IR 以 `scope=item|slate` 区分逐物品条件和列表聚合；v1.0 输入继续按 item scope 兼容读取。旧 v1–v3 Prompt 文件仍保留用于历史复现。
 
+> 源码发布说明：GitHub 分支只保存源码、测试、运行脚本和 README。实验 YAML、Gold JSONL、候选 artifact、checkpoint 与结果文件均在本地维护，不纳入版本控制。下列命令中的 `/path/to/local/...` 需要替换为本机对应文件。
+
 ## 安装
 
 在仓库根目录、`LLM_Rec` 环境中执行：
@@ -46,7 +48,7 @@ python -m pip install -e COPA
 
 ```bash
 python -m copa.experiments.run_phase1 \
-  --config COPA/configs/smoke.yaml \
+  --config /path/to/local/smoke.yaml \
   --experiment all \
   --output-dir /tmp/copa_smoke
 ```
@@ -54,9 +56,9 @@ python -m copa.experiments.run_phase1 \
 运行独立实验：
 
 ```bash
-python -m copa.experiments.run_phase1 --config COPA/configs/experiment_a.yaml --experiment A
-python -m copa.experiments.run_phase1 --config COPA/configs/experiment_b.yaml --experiment B
-python -m copa.experiments.run_phase1 --config COPA/configs/experiment_c.yaml --experiment C
+python -m copa.experiments.run_phase1 --config /path/to/local/experiment_a.yaml --experiment A
+python -m copa.experiments.run_phase1 --config /path/to/local/experiment_b.yaml --experiment B
+python -m copa.experiments.run_phase1 --config /path/to/local/experiment_c.yaml --experiment C
 ```
 
 正式配置默认使用现有 `data/processed/beauty_scenario1_*.parquet`，执行 100 用户、3 个 seed、Top-10、100 个候选、100 个个体和 50 代优化。建议先运行 smoke。
@@ -67,7 +69,7 @@ python -m copa.experiments.run_phase1 --config COPA/configs/experiment_c.yaml --
 
 ```bash
 python -m copa.experiments.run_core \
-  --config COPA/configs/core_experiment.yaml \
+  --config /path/to/local/core_experiment.yaml \
   --suite core --workers 4 --cohort-seed 42 \
   --output-dir COPA/results/core_run --resume
 ```
@@ -111,7 +113,7 @@ conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
 
 ```bash
 conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
-  suite --config COPA/configs/retrieval_extension.yaml \
+  suite --config /path/to/local/retrieval_extension.yaml \
   --output-dir COPA/results/retrieval_formal --resume
 ```
 
@@ -120,7 +122,8 @@ conda run -n LLM_Rec python -m copa.experiments.run_retrieval_extension \
 ```bash
 tmux new-session -d -s copa_slate_multi_positive_v2 \
   "bash COPA/scripts/run_slate_multi_positive_v2.sh \
-   COPA/results/slate_multi_positive_v2 4 2>&1 | tee /tmp/copa_slate_multi_positive_v2.log"
+   COPA/results/slate_multi_positive_v2 4 /path/to/local/retrieval_extension.yaml \
+   2>&1 | tee /tmp/copa_slate_multi_positive_v2.log"
 ```
 
 已有 v2 召回 artifact 时，kernel-v2 优化重跑不重新训练模型。门控脚本依次执行全量测试、两数据集严格校准、artifact/multi-positive 复核、8+8 用户满预算性能 pilot，全部通过后才启动正式矩阵：
@@ -208,7 +211,7 @@ OLLAMA_MODELS=/home/linchengkai/ollama/models \
 编译自然语言，不执行推荐：
 
 ```bash
-python -m copa.phase2.cli --config COPA/configs/phase2_qwen.yaml compile \
+python -m copa.phase2.cli --config /path/to/local/phase2_qwen.yaml compile \
   --domain synthetic \
   --text "推荐50美元以内且有货的商品，最好品牌多样，给我5个"
 ```
@@ -216,7 +219,7 @@ python -m copa.phase2.cli --config COPA/configs/phase2_qwen.yaml compile \
 编译并调用 Phase 1 确定性推荐：
 
 ```bash
-python -m copa.phase2.cli --config COPA/configs/phase2_qwen.yaml recommend \
+python -m copa.phase2.cli --config /path/to/local/phase2_qwen.yaml recommend \
   --domain synthetic \
   --text "推荐60美元以内的商品，尽量品牌多样，给我5个"
 ```
@@ -224,8 +227,8 @@ python -m copa.phase2.cli --config COPA/configs/phase2_qwen.yaml recommend \
 完整双语 Compiler 评测：
 
 ```bash
-python -m copa.phase2.cli --config COPA/configs/phase2_qwen.yaml evaluate \
-  --gold COPA/evaluation/constraint_compiler_gold.jsonl \
+python -m copa.phase2.cli --config /path/to/local/phase2_qwen.yaml evaluate \
+  --gold /path/to/local/constraint_compiler_gold.jsonl \
   --output-dir COPA/results/phase2_compiler_eval
 ```
 
@@ -238,7 +241,7 @@ python -m copa.phase2.cli --config COPA/configs/phase2_qwen.yaml evaluate \
 启动一个 Agent thread：
 
 ```bash
-python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml run \
+python -m copa.phase3.cli --config /path/to/local/phase3_agent.yaml run \
   --thread-id demo-001 --domain synthetic \
   --text "推荐5个价格不超过60美元的商品，品牌尽量多样"
 ```
@@ -246,23 +249,23 @@ python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml run \
 如果返回 `clarification_required`，使用同一 thread 恢复：
 
 ```bash
-python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml resume \
+python -m copa.phase3.cli --config /path/to/local/phase3_agent.yaml resume \
   --thread-id demo-001 --answer "最高价格是60美元"
 ```
 
 状态与清理：
 
 ```bash
-python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml status --thread-id demo-001
-python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml cleanup --thread-id demo-001
-python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml cleanup --older-than-days 7
+python -m copa.phase3.cli --config /path/to/local/phase3_agent.yaml status --thread-id demo-001
+python -m copa.phase3.cli --config /path/to/local/phase3_agent.yaml cleanup --thread-id demo-001
+python -m copa.phase3.cli --config /path/to/local/phase3_agent.yaml cleanup --older-than-days 7
 ```
 
 运行 44 条中英 Agent Gold（含 8 条列表级故障）：
 
 ```bash
-python -m copa.phase3.cli --config COPA/configs/phase3_agent.yaml evaluate \
-  --gold COPA/evaluation/agent_workflow_gold.jsonl \
+python -m copa.phase3.cli --config /path/to/local/phase3_agent.yaml evaluate \
+  --gold /path/to/local/agent_workflow_gold.jsonl \
   --output-dir COPA/results/phase3_agent_eval
 ```
 
