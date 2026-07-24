@@ -1,0 +1,5 @@
+# Mature offline retrieval backends used by the COPA retrieval-extension suite.
+# RecBole owns the formal BPR, ItemKNN, and SASRec implementations.  implicit is
+# retained only for explicitly named BM25/TF-IDF ItemKNN variants.
+recbole==1.2.1
+implicit==0.7.3
