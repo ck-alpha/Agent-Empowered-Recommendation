@@ -111,18 +111,14 @@ def test_phase1_session_feasible_topk_is_deterministic():
     assert first.diagnostics["strategy"] == "feasible_topk"
 
 
-def test_agent_gold_has_36_bilingual_scenarios():
+def test_agent_gold_has_44_bilingual_scenarios():
     from pathlib import Path
-
-    import pytest
 
     from copa.phase3.evaluation import load_agent_gold
 
     path = Path(__file__).resolve().parents[1] / "evaluation" / "agent_workflow_gold.jsonl"
-    if not path.exists():
-        pytest.skip("external Phase 3 Gold corpus is not included in the source-only repository")
     cases = load_agent_gold(path)
-    assert len(cases) == 36
+    assert len(cases) == 44
     assert {case["language"] for case in cases} == {"zh", "en"}
     assert {case["scenario"] for case in cases} == {"seen", "compositional", "repair", "unseen"}
 

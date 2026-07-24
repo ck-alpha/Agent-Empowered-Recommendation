@@ -1,0 +1,100 @@
+# Formal mature-retrieval protocol. Run from the repository root.
+tuning_seed: 42
+final_seeds: [42, 43, 44]
+cohort_seed: 42
+# Full-sort retrieval is evaluated for every retained user. The fixed downstream
+# optimization cohorts are declared per dataset and never coverage-filtered.
+export_cohort_size: 0
+
+evaluation:
+  slate_preflight_time_limit_seconds: 2.0
+  opportunity_solver_time_limit_seconds: 5.0
+  optimizer_time_limit_seconds: 120.0
+  optimizer_kernel_version: 2
+
+slate_calibration:
+  enabled: true
+  candidate_k: 100
+  top_k: 10
+  solver_time_limit_seconds: 2.0
+  alpha_grid: [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40, 1.45, 1.50]
+  brand_cap_grid: [1, 2, 3, 4]
+  electronics_category_distinct_grid: [2, 3, 4, 5, 6, 7, 8, 9, 10]
+  target_feasible_rates:
+    loose: [0.90, 0.98]
+    medium: [0.70, 0.85]
+    tight: [0.45, 0.65]
+
+defaults:
+  epochs: 100
+  stopping_step: 10
+  max_candidate_k: 500
+  train_batch_size: 4096
+  eval_batch_size: 4096
+  learning_rate: 0.001
+
+datasets:
+  - name: beauty_5core
+    interactions: data/processed/beauty_scenario1_interactions.parquet
+    items: data/processed/beauty_scenario1_items.parquet
+    k_core: 5
+    protocol: deduplicated_5core_frozen_train_leave_one_valid_two_test_v2
+    downstream_cohort_size: 253
+  - name: electronics_5core
+    interactions: data/processed/electronics_scenario1_sample1m_interactions.parquet
+    items: data/processed/electronics_scenario1_sample1m_items.parquet
+    k_core: 5
+    protocol: deduplicated_5core_frozen_train_leave_one_valid_two_test_v2
+    downstream_cohort_size: 500
+    model_overrides:
+      bpr: {eval_batch_size: 16384}
+      itemknn: {eval_batch_size: 16384}
+      sasrec: {eval_batch_size: 8192}
+
+# Eight validation trials per model: equal tuning budget, seed 42 only.
+models:
+  bpr:
+    trials:
+      - parameters: {embedding_size: 64, reg_weight: 0.0001}
+      - parameters: {embedding_size: 128, reg_weight: 0.0001}
+      - learning_rate: 0.0005
+        parameters: {embedding_size: 64, reg_weight: 0.0001}
+      - learning_rate: 0.0005
+        parameters: {embedding_size: 128, reg_weight: 0.0001}
+      - parameters: {embedding_size: 64, reg_weight: 0.00001}
+      - parameters: {embedding_size: 64, reg_weight: 0.001}
+      - parameters:
+          embedding_size: 64
+          reg_weight: 0.0001
+          train_neg_sample_args: {distribution: popularity, sample_num: 1, alpha: 1.0, dynamic: false, candidate_num: 0}
+      - parameters:
+          embedding_size: 64
+          reg_weight: 0.0001
+          train_neg_sample_args: {distribution: uniform, sample_num: 3, alpha: 1.0, dynamic: false, candidate_num: 0}
+
+  itemknn:
+    epochs: 1
+    stopping_step: 1
+    trials:
+      - parameters: {k: 20, shrink: 0.0, knn_method: item}
+      - parameters: {k: 50, shrink: 0.0, knn_method: item}
+      - parameters: {k: 100, shrink: 0.0, knn_method: item}
+      - parameters: {k: 200, shrink: 0.0, knn_method: item}
+      - parameters: {k: 20, shrink: 10.0, knn_method: item}
+      - parameters: {k: 50, shrink: 10.0, knn_method: item}
+      - parameters: {k: 100, shrink: 10.0, knn_method: item}
+      - parameters: {k: 200, shrink: 10.0, knn_method: item}
+
+  sasrec:
+    train_batch_size: 1024
+    eval_batch_size: 1024
+    trials:
+      - parameters: {hidden_size: 64, inner_size: 256, n_layers: 1, n_heads: 2, hidden_dropout_prob: 0.2, attn_dropout_prob: 0.2, loss_type: CE, MAX_ITEM_LIST_LENGTH: 50}
+      - parameters: {hidden_size: 64, inner_size: 256, n_layers: 2, n_heads: 2, hidden_dropout_prob: 0.2, attn_dropout_prob: 0.2, loss_type: CE, MAX_ITEM_LIST_LENGTH: 50}
+      - parameters: {hidden_size: 128, inner_size: 512, n_layers: 2, n_heads: 4, hidden_dropout_prob: 0.2, attn_dropout_prob: 0.2, loss_type: CE, MAX_ITEM_LIST_LENGTH: 50}
+      - parameters: {hidden_size: 64, inner_size: 256, n_layers: 2, n_heads: 2, hidden_dropout_prob: 0.5, attn_dropout_prob: 0.5, loss_type: CE, MAX_ITEM_LIST_LENGTH: 50}
+      - parameters: {hidden_size: 64, inner_size: 256, n_layers: 1, n_heads: 2, hidden_dropout_prob: 0.2, attn_dropout_prob: 0.2, loss_type: BPR, MAX_ITEM_LIST_LENGTH: 50}
+      - parameters: {hidden_size: 64, inner_size: 256, n_layers: 2, n_heads: 2, hidden_dropout_prob: 0.2, attn_dropout_prob: 0.2, loss_type: BPR, MAX_ITEM_LIST_LENGTH: 50}
+      - parameters: {hidden_size: 64, inner_size: 256, n_layers: 2, n_heads: 2, hidden_dropout_prob: 0.2, attn_dropout_prob: 0.2, loss_type: CE, MAX_ITEM_LIST_LENGTH: 100}
+      - learning_rate: 0.0005
+        parameters: {hidden_size: 64, inner_size: 256, n_layers: 2, n_heads: 2, hidden_dropout_prob: 0.2, attn_dropout_prob: 0.2, loss_type: CE, MAX_ITEM_LIST_LENGTH: 50}

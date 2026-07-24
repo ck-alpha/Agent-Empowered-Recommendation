@@ -244,7 +244,7 @@ COPA/configs/smoke.yaml
 !COPA/configs/experiment_c.yaml
 !COPA/configs/smoke.yaml
 
-# Source-only publication policy. Generated data, experiment manifests, and
+# Repository publication policy. Generated data, runtime manifests, logs, and
 # documentation other than the two repository READMEs stay local.
 *.yaml
 *.yml
@@ -268,3 +268,9 @@ COPA/configs/smoke.yaml
 /results/
 /logs/
 /checkpoints/
+
+# Versioned COPA reproducibility inputs.
+!/COPA/configs/
+!/COPA/configs/*.yaml
+!/COPA/evaluation/
+!/COPA/evaluation/*.jsonl

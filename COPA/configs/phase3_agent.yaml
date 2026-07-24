@@ -1,0 +1,41 @@
+ollama:
+  base_url: http://127.0.0.1:11434
+  model: qwen2.5:14b
+  connect_timeout_seconds: 5
+  read_timeout_seconds: 180
+  temperature: 0
+  seed: 42
+  num_ctx: 4096
+  num_predict: 1024
+  keep_alive: 5m
+compiler:
+  prompt_version: constraint_compiler_v4
+  max_attempts: 2
+  retry_backoff_seconds: 0.5
+planner:
+  prompt_version: planner_v1
+  max_attempts: 2
+  retry_backoff_seconds: 0.5
+repair:
+  prompt_version: repair_v1
+  max_attempts: 2
+  retry_backoff_seconds: 0.5
+agent:
+  max_repairs: 2
+dataset:
+  processed_dir: data/processed
+  prefix: beauty_scenario1
+  candidate_k: 100
+  candidate_count: 30
+optimization:
+  top_k: 10
+  population_size: 30
+  generations: 10
+paths:
+  checkpoint: COPA/checkpoints/phase3.sqlite
+  trace_dir: COPA/logs/phase3
+  candidate_trace_dir: COPA/logs/phase3/candidates
+evaluation:
+  seed: 42
+  enable_fault_injection: true
+  compare_modes: true

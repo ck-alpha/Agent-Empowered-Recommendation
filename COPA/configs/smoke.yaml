@@ -1,0 +1,17 @@
+dataset:
+  type: synthetic
+  candidate_count: 24
+seeds: [42]
+optimization:
+  top_k: 5
+  population_size: 20
+  generations: 3
+  crossover_rate: 0.9
+  mutation_rate: 0.2
+  tournament_size: 2
+  selection_strategy: compromise
+objectives:
+  include_fairness: true
+metrics:
+  hypervolume_sample_power: 8
+output_dir: COPA/results/smoke

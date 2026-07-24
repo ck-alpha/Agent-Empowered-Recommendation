@@ -8,7 +8,8 @@ logs/
 results/
 checkpoints/
 
-# Code-only publication policy: README is the only published document.
+# Generated artifacts stay local; reproducibility configs and Gold corpora are
+# explicitly versioned below.
 *.md
 !/README.md
 *.yaml
@@ -20,3 +21,8 @@ checkpoints/
 *.jpeg
 *.gif
 *.svg
+
+!/configs/
+!/configs/*.yaml
+!/evaluation/
+!/evaluation/*.jsonl

@@ -146,12 +146,10 @@ def test_boundary_and_set_conflicts_are_detected(constraints, expected_code):
     assert expected_code in {issue.code for issue in result.issues}
 
 
-def test_gold_corpus_has_sixty_bilingual_cases():
+def test_gold_corpus_has_ninety_two_bilingual_cases():
     from copa.phase2.evaluation import load_gold_cases
 
     path = Path(__file__).resolve().parents[1] / "evaluation" / "constraint_compiler_gold.jsonl"
-    if not path.exists():
-        pytest.skip("external Phase 2 Gold corpus is not included in the source-only repository")
     cases = load_gold_cases(path)
-    assert len(cases) == 60
+    assert len(cases) == 92
     assert {case["language"] for case in cases} == {"zh", "en"}

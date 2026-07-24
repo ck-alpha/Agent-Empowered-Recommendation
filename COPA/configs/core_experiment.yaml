@@ -1,0 +1,26 @@
+suite: core
+dataset:
+  type: beauty
+  processed_dir: data/processed
+  prefix: beauty_scenario1
+  num_users: 100
+  candidate_k: 100
+  min_history: 2
+cohort_seed: 42
+seeds: [42, 43, 44]
+workers: 4
+optimization:
+  top_k: 10
+  population_size: 100
+  generations: 50
+  crossover_rate: 0.9
+  mutation_rate: 0.15
+  tournament_size: 2
+objectives:
+  weighted_ga_weights: [0.3333333333, 0.3333333333, 0.3333333334]
+metrics:
+  hypervolume_sample_power: 14
+  hypervolume_bounds:
+    lower: [0.0, 0.0, 0.0]
+    upper: [1.0, 1.0, 1.0]
+output_dir: COPA/results/core
